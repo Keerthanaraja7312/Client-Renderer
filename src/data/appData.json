@@ -1,0 +1,28 @@
+{
+  "clinics": [
+    { "id": "sunrise", "name": "Sunrise Family Clinic", "doctor": "Dr. Anjali Rao", "specialty": "General Medicine", "address": "12 MG Road, Coimbatore", "phone": "+91 98765 43210", "timings": "Mon-Sat, 9:00 AM - 6:00 PM", "rating": 4.6 },
+    { "id": "greenleaf", "name": "GreenLeaf Multispecialty Clinic", "doctor": "Dr. Karthik Menon", "specialty": "Orthopedics", "address": "45 Race Course Road, Coimbatore", "phone": "+91 98450 11223", "timings": "Mon-Fri, 10:00 AM - 7:00 PM", "rating": 4.8 },
+    { "id": "citycare", "name": "CityCare Diagnostics & Clinic", "doctor": "Dr. Priya Sundaram", "specialty": "Pediatrics", "address": "8 Avinashi Road, Coimbatore", "phone": "+91 90477 88990", "timings": "Tue-Sun, 9:00 AM - 5:00 PM", "rating": 4.5 },
+    { "id": "wellspring", "name": "Wellspring Wellness Clinic", "doctor": "Dr. Ramesh Iyer", "specialty": "Cardiology", "address": "21 DB Road, RS Puram, Coimbatore", "phone": "+91 89400 22110", "timings": "Mon-Sat, 8:00 AM - 2:00 PM", "rating": 4.7 }
+  ],
+  "patients": [
+    { "id": "p1", "name": "Ananya Iyer", "email": "ananya@example.com", "clinic": "sunrise", "status": "Active" },
+    { "id": "p2", "name": "Rahul Verma", "email": "rahul@example.com", "clinic": "greenleaf", "status": "Pending" },
+    { "id": "p3", "name": "Emily Chen", "email": "emily@example.com", "clinic": "citycare", "status": "Active" },
+    { "id": "p4", "name": "James Carter", "email": "james@example.com", "clinic": "wellspring", "status": "Inactive" },
+    { "id": "p5", "name": "Fatima Al Sayed", "email": "fatima@example.com", "clinic": "sunrise", "status": "Active" },
+    { "id": "p6", "name": "Wei Tan", "email": "wei@example.com", "clinic": "greenleaf", "status": "Pending" }
+  ],
+  "branches": [
+    { "id": "b1", "name": "Coimbatore Central Branch", "address": "12 MG Road, Coimbatore", "manager": "Suresh Kumar", "phone": "+91 98765 00001" },
+    { "id": "b2", "name": "RS Puram Branch", "address": "21 DB Road, RS Puram, Coimbatore", "manager": "Divya Nair", "phone": "+91 98765 00002" },
+    { "id": "b3", "name": "Avinashi Road Branch", "address": "8 Avinashi Road, Coimbatore", "manager": "Karthik Menon", "phone": "+91 98765 00003" },
+    { "id": "b4", "name": "Race Course Branch", "address": "45 Race Course Road, Coimbatore", "manager": "Priya Sundaram", "phone": "+91 98765 00004" }
+  ],
+  "doctors": [
+    { "id": "d1", "name": "Dr. Anjali Rao", "specialty": "General Medicine", "clinic": "sunrise", "phone": "+91 98765 43210", "experience": "12 yrs" },
+    { "id": "d2", "name": "Dr. Karthik Menon", "specialty": "Orthopedics", "clinic": "greenleaf", "phone": "+91 98450 11223", "experience": "9 yrs" },
+    { "id": "d3", "name": "Dr. Priya Sundaram", "specialty": "Pediatrics", "clinic": "citycare", "phone": "+91 90477 88990", "experience": "15 yrs" },
+    { "id": "d4", "name": "Dr. Ramesh Iyer", "specialty": "Cardiology", "clinic": "wellspring", "phone": "+91 89400 22110", "experience": "18 yrs" }
+  ]
+}

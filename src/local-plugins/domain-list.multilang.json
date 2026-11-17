@@ -1,0 +1,7 @@
+{
+  "module": "domain-list",
+  "propMap": {
+    "titleKey": "title",
+    "createLabelKey": "createLabel"
+  }
+}

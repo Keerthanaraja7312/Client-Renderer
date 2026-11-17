@@ -1,0 +1,10 @@
+{
+  "module": "form",
+  "propMap": {
+    "formTitleKey": "formTitle",
+    "submitLabelKey": "submitLabel",
+    "successMessageKey": "successMessage",
+    "reviewTitleKey": "reviewTitle",
+    "confirmLabelKey": "confirmLabel"
+  }
+}
