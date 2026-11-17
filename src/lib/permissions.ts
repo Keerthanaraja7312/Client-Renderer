@@ -57,11 +57,16 @@ export function describeAuth(): string {
   );
 }
 
-/** Re-read roles and permissions from the backend. Safe to call without a token. */
-export async function refreshAuthContext(token: string | null): Promise<void> {
+/**
+ * Re-read roles and permissions from the backend. Safe to call without a token.
+ * pageSlug: the page being shown - the backend then returns only what the user may do
+ * inside that page's project (without it, permissions from every project are merged).
+ */
+export async function refreshAuthContext(token: string | null, pageSlug?: string): Promise<void> {
   if (!token) return;
   try {
-    const res = await fetch(`${API_BASE}/auth/me`, { headers: { Authorization: `Bearer ${token}` } });
+    const qs = pageSlug ? `?page_slug=${encodeURIComponent(pageSlug)}` : '';
+    const res = await fetch(`${API_BASE}/auth/me${qs}`, { headers: { Authorization: `Bearer ${token}` } });
     if (!res.ok) return;
     const json = await res.json();
     if (json?.status === 'success' && json.data) saveAuthContext(json.data);

@@ -40,7 +40,7 @@ export function PageViewer({ slug }: { slug: string }) {
     fetchPublishedPage(slug)
       .then(async (page) => {
         // Pick up role/permission changes made in the RBAC screens since login.
-        await refreshAuthContext(getToken());
+        await refreshAuthContext(getToken(), slug);
         if (cancelled) return;
         const doc = parsePageDocument(page.document);
         // Saved Pages that sidebar menu items open travel inside the document.
