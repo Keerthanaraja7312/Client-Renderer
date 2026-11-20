@@ -11,6 +11,10 @@ export interface SavedTemplateRow {
   plugin_id: string;
   instance: any;
   created_by: string | null;
+  /** Project the template belongs to (null = none). */
+  project_id: number | null;
+  /** That project's name, joined by the backend (null = none). */
+  project_name: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -46,6 +50,8 @@ export async function createSavedTemplate(payload: {
   plugin_id: string;
   instance: any;
   created_by?: string | null;
+  /** Project this template belongs to; omit / null for none. */
+  project_id?: number | null;
 }): Promise<SavedTemplateRow> {
   const res = await fetch(`${API_BASE}/saved-templates/`, {
     method: 'POST',
@@ -67,7 +73,8 @@ export async function deleteSavedTemplate(id: number | string): Promise<void> {
 /** PUT /saved-templates/{id} — overwrite an existing snapshot in place. */
 export async function updateSavedTemplate(
   id: number | string,
-  payload: { name?: string; plugin_id?: string; instance?: any },
+  // project_id: a number moves it to that project, null detaches it, omitted keeps it.
+  payload: { name?: string; plugin_id?: string; instance?: any; project_id?: number | null },
 ): Promise<SavedTemplateRow> {
   const res = await fetch(`${API_BASE}/saved-templates/${id}`, {
     method: 'PUT',

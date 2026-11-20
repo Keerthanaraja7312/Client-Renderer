@@ -1,11 +1,14 @@
 import type { ComponentInstance } from './plugin';
 import {
+  collectRefs,
   getTemplate,
   seedTemplates,
   TEMPLATE_SOURCE_KEY,
+  type SavedRef,
   type SavedTemplate,
 } from './templateStore';
 import { TPL_PREFIX } from './navigation';
+import { setActiveProject } from '../../api/datastoreApi';
 import { getLayouts, type GridLayoutItem } from '../ui/gridLayout';
 
 // ─── The "page document" ─────────────────────────────────────────────────────
@@ -31,6 +34,10 @@ export interface PageDocument {
   instances: ComponentInstance[];
   layouts: Record<string, GridLayoutItem[]>;
   templates: Record<string, SavedTemplate>;
+  /** Project this page was published under. */
+  projectId?: string | null;
+  /** Every Page / Block on the page as { projectId, pageId, blockId } rows. */
+  refs?: SavedRef[];
   /** Informational: when the document was produced. */
   builtAt?: string;
   [key: string]: unknown;
@@ -84,7 +91,11 @@ function stripBuilderMarkers(list: any[] | undefined) {
  * Pulls in every saved template the page links to (including templates
  * linked from inside other templates).
  */
-export function buildPageDocument(instances: ComponentInstance[], layouts: unknown): BuildResult {
+export function buildPageDocument(
+  instances: ComponentInstance[],
+  layouts: unknown,
+  projectId: string | null = null,
+): BuildResult {
   const docInstances = clone(instances);
   stripBuilderMarkers(docInstances);
 
@@ -101,6 +112,8 @@ export function buildPageDocument(instances: ComponentInstance[], layouts: unkno
     }
     const copy = clone(tpl);
     stripBuilderMarkers([copy.instance]);
+    copy.projectId = copy.projectId ?? projectId;
+    copy.refs = collectRefs(copy.instance, copy.projectId ?? null);
     templates[tpl.id] = copy;
     queue.push(...templateIdsIn([copy.instance]));
   }
@@ -111,6 +124,8 @@ export function buildPageDocument(instances: ComponentInstance[], layouts: unkno
       instances: docInstances,
       layouts: clone(getLayouts(layouts)),
       templates,
+      projectId,
+      refs: docInstances.flatMap((i) => collectRefs(i, projectId)),
       builtAt: new Date().toISOString(),
     },
     missingTemplates: [...missing],
@@ -148,4 +163,8 @@ export function parsePageDocument(raw: unknown): PageDocument {
  */
 export function seedDocumentTemplates(doc: PageDocument, markLoaded = false): void {
   seedTemplates(Object.values(doc.templates ?? {}), markLoaded);
+  // Client mode: tell the data layer which project this page was published under.
+  // Without it, related-domain tabs (Task, User...) are not found, because table
+  // names are resolved per project and the client has no project selected.
+  if (markLoaded && doc.projectId != null) setActiveProject(doc.projectId);
 }

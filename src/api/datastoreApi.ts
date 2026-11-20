@@ -238,7 +238,64 @@ export async function fetchAllSchemas(): Promise<BackendSchemasListResponse> {
   return apiFetch('/datastore/schemas');
 }
 
+// ─── Plain domain name → this project's table ────────────────────────────────
+// Tables are stored per project as "<Name>__<projectId>" (Output__31, User__31),
+// while link fields, junction tables and relations only carry the plain name
+// ("Output", "User31"). A plain name can therefore also hit another project's
+// unsuffixed table (e.g. project 30's "Output"). Every row / schema call below
+// maps the name to the table of the project currently selected in the top bar.
+let _schemaNamesCache: { at: number; list: Promise<{ table_name: string; project_id?: string | null }[]> } | null = null;
+function _schemaNames() {
+  if (!_schemaNamesCache || Date.now() - _schemaNamesCache.at > 30_000) {
+    const list = apiFetch('/datastore/schemas')
+      .then(r => (Array.isArray(r?.schemas) ? r.schemas : []))
+      .catch(() => { _schemaNamesCache = null; return []; });
+    _schemaNamesCache = { at: Date.now(), list };
+  }
+  return _schemaNamesCache.list;
+}
+// The published client runs on its own origin, so it has no 'svb_current_project'
+// in localStorage (that key is only written by the builder). It sets the page's
+// project here instead, and every table lookup below then resolves plain names
+// ("Output", "Task") to that project's tables ("Output__31") exactly like the builder.
+let _activeProject: string | null = null;
+export function setActiveProject(id: string | number | null | undefined): void {
+  const next = id != null && String(id) !== '' && String(id) !== '__none__' ? String(id) : null;
+  if (next === _activeProject) return;
+  _activeProject = next;
+  _schemaNamesCache = null;
+}
+export function getActiveProject(): string | null {
+  return _activeProject;
+}
+function _currentProject(): string | null {
+  if (_activeProject) return _activeProject;
+  try {
+    const v = localStorage.getItem('svb_current_project');
+    return v && v !== '__none__' ? v : null;
+  } catch { return null; }
+}
+
+/** The table to use for `name` in the currently selected project (or `name` itself). */
+export async function resolveTableName(name: string): Promise<string> {
+  const project = _currentProject();
+  if (!project || !name) return name;
+  const list = await _schemaNames();
+  if (list.length === 0) return name;
+  const lc = name.toLowerCase();
+  const inProject = list.filter(s => s.project_id != null && String(s.project_id) === project);
+  // already a table of this project
+  if (inProject.some(s => s.table_name === name)) return name;
+  // "<name>__<project>", else the same name with underscores dropped ("User31" → "User__31")
+  const hit =
+    inProject.find(s => s.table_name.toLowerCase() === `${lc}__${project}`) ??
+    inProject.find(s => s.table_name.replace(/_/g, '').toLowerCase() === lc);
+  return hit ? hit.table_name : name;
+}
+
 export interface DomainSchemaResult {
+  /** The table actually read (a plain domain name is mapped to the project's table). */
+  table_name?: string;
   schema:     BackendSchemaField[];
   db_backend: 'dynamodb' | 'postgresql';
   versioned?: boolean;
@@ -282,9 +339,11 @@ export function normalizeSchemaField<T extends Record<string, any>>(f: T): T {
 
 /** GET /datastore/schemas/{table_name} — get schema + db_backend for one domain table */
 export async function fetchDomainSchema(tableName: string): Promise<DomainSchemaResult> {
+  tableName = await resolveTableName(tableName);
   const res = await apiFetch(`/datastore/schemas/${encodeURIComponent(tableName)}`);
   if (res.status !== 'success') throw new Error(res.message ?? 'Failed to fetch schema');
   return {
+    table_name: tableName,
     schema:     (res.schema ?? []) as BackendSchemaField[],
     db_backend: res.db_backend ?? 'dynamodb',
     versioned:  !!res.versioned,
@@ -293,12 +352,14 @@ export async function fetchDomainSchema(tableName: string): Promise<DomainSchema
 
 /** GET /datastore/{table_name}/rows — fetch all rows for a domain table */
 export async function fetchDomainRows(tableName: string): Promise<Record<string, any>[]> {
+  tableName = await resolveTableName(tableName);
   const res = await apiFetch(`/datastore/${encodeURIComponent(tableName)}/rows`);
   if (res.status !== 'success') throw new Error(res.message ?? 'Failed to fetch rows');
   return normalizeRows(res.data);
 }
 
 export async function fetchArchivedRows(tableName: string): Promise<Record<string, any>[]> {
+  tableName = await resolveTableName(tableName);
   const res = await apiFetch(`/datastore/${encodeURIComponent(tableName)}/archived`);
   if (res.status !== 'success') throw new Error(res.message ?? 'Failed to fetch archived rows');
   return normalizeRows(res.data);
@@ -310,6 +371,7 @@ export async function updateDomainRow(
   recordId: string,
   data: Record<string, any>,
 ): Promise<{ status: string; record_id?: string; message?: string; versioned?: boolean; previous_id?: string }> {
+  tableName = await resolveTableName(tableName);
   return apiFetch(`/datastore/${encodeURIComponent(tableName)}/row/${encodeURIComponent(recordId)}`, {
     method: 'PUT',
     body: JSON.stringify(data),
@@ -321,6 +383,7 @@ export async function deleteDomainRow(
   tableName: string,
   recordId: string,
 ): Promise<{ status: string; record_id?: string; message?: string }> {
+  tableName = await resolveTableName(tableName);
   return apiFetch(`/datastore/${encodeURIComponent(tableName)}/row/${encodeURIComponent(recordId)}`, {
     method: 'DELETE',
   });
@@ -331,6 +394,7 @@ export async function restoreDomainRow(
   tableName: string,
   recordId: string,
 ): Promise<{ status: string; record_id?: string; message?: string }> {
+  tableName = await resolveTableName(tableName);
   return apiFetch(`/datastore/${encodeURIComponent(tableName)}/row/${encodeURIComponent(recordId)}/restore`, {
     method: 'POST',
   });
@@ -384,6 +448,7 @@ export async function submitFormRow(
   tableName: string,
   row: Record<string, any>,
 ): Promise<{ status: string; record_id?: string; message?: string; errors?: Record<string, string> }> {
+  tableName = await resolveTableName(tableName);
   return apiFetch(`/datastore/${encodeURIComponent(tableName)}/row`, {
     method: 'POST',
     body: JSON.stringify(row),

@@ -42,8 +42,15 @@ export function listPages(instances: ComponentInstance[] = []): PageOption[] {
 }
 
 /** Saved Page templates (Save button in the config panel) that a menu item can open. */
-export function listSavedPages(templates: { id: string; name: string; pluginId: string }[] = []): PageOption[] {
+export function listSavedPages(
+  templates: { id: string; name: string; pluginId: string; projectId?: string | null }[] = [],
+  /** Project from the top-nav selector: only its saved pages are listed (null/undefined = all). */
+  projectId?: string | null,
+  /** A page link that must stay listed even if it belongs to another project. */
+  keepLink?: string,
+): PageOption[] {
   return templates
+    .filter((t) => !projectId || t.projectId === projectId || `${TPL_PREFIX}${t.id}` === keepLink)
     .filter((t) => t.pluginId === PAGE_PLUGIN_ID)
     .map((t) => ({ id: `${TPL_PREFIX}${t.id}`, label: t.name }));
 }
@@ -57,7 +64,9 @@ function materializeTemplatePage(link: string): ComponentInstance | null {
   const key = `${tpl.id}@${tpl.savedAt}`;
   let inst = tplInstances.get(key);
   if (!inst) {
-    inst = cloneInstanceWithNewIds(tpl.instance);
+    // Deterministic ids: the builder preview and the published client build the
+    // exact same ids (and so the same state paths) for a given saved page.
+    inst = cloneInstanceWithNewIds(tpl.instance, { idFor: (old) => `tpl${tpl.id}-${old}` });
     tplInstances.set(key, inst);
   }
   return inst;

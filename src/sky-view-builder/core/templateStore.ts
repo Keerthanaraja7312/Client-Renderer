@@ -45,6 +45,53 @@ export interface SavedTemplate {
   pluginId: string;
   savedAt: number;
   instance: ComponentInstance;
+  /** Project this template was saved for (absent / null = none). */
+  projectId?: string | null;
+  projectName?: string | null;
+  /** Flat index of every project / page / block id inside this snapshot, so a
+   *  published page can locate the exact saved block without walking the tree. */
+  refs?: SavedRef[];
+}
+
+/** One row of the id index stored with every saved page/block. */
+export interface SavedRef {
+  projectId: string | null;
+  /** Page the block sits on (null when the snapshot has no Page). */
+  pageId: string | null;
+  /** Block instance id (== configs.blockId). */
+  blockId: string;
+}
+
+/** Config key on the snapshot root that persists `refs` inside the stored JSON,
+ *  so it round-trips through the backend without a schema change. */
+export const SAVED_REF_KEY = '__savedRefs';
+
+/** Builds the project/page/block index for an instance tree. */
+export function collectRefs(root: ComponentInstance, projectId: string | null): SavedRef[] {
+  const refs: SavedRef[] = [];
+  const walk = (inst: any, pageId: string | null) => {
+    if (!inst || typeof inst !== 'object') return;
+    const c = inst.configs ?? {};
+    let page = pageId;
+    if (inst.pluginId === 'page-plugin') page = c.pageId || c.pageMeta?.id || inst.id;
+    if (inst.pluginId === 'block-plugin') refs.push({ projectId, pageId: page, blockId: c.blockId || inst.id });
+    (c.blocks ?? []).forEach((b: any) => walk(b, page));
+    (c.components ?? []).forEach((b: any) => walk(b, page));
+  };
+  walk(root, null);
+  return refs;
+}
+
+/** Stamps the id index onto a snapshot's root configs (mutates + returns it). */
+function stampRefs(snapshot: ComponentInstance, projectId: string | null): ComponentInstance {
+  snapshot.configs = { ...(snapshot.configs as any), [SAVED_REF_KEY]: collectRefs(snapshot, projectId) };
+  return snapshot;
+}
+
+/** Project chosen in the Save dialog. `id: null` = "No project". */
+export interface TemplateProject {
+  id: string | null;
+  name: string | null;
 }
 
 let cache: SavedTemplate[] = [];
@@ -84,13 +131,22 @@ function notify() {
   window.dispatchEvent(new Event(CHANGE_EVENT));
 }
 
-function fromRow(row: { id: number; name: string; plugin_id: string; instance: any; updated_at: string }): SavedTemplate {
+function fromRow(row: {
+  id: number; name: string; plugin_id: string; instance: any; updated_at: string;
+  project_id?: number | null; project_name?: string | null;
+}): SavedTemplate {
+  const projectId = row.project_id != null ? String(row.project_id) : null;
+  const instance = row.instance as ComponentInstance;
   return {
     id: String(row.id),
     name: row.name,
     pluginId: row.plugin_id,
     savedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
-    instance: row.instance as ComponentInstance,
+    instance,
+    projectId,
+    projectName: row.project_name ?? null,
+    // The backend row is the source of truth for the project; rebuild the index from it.
+    refs: collectRefs(instance, projectId),
   };
 }
 
@@ -136,7 +192,7 @@ export function listTemplates(): SavedTemplate[] {
   return [...cache].sort((a, b) => b.savedAt - a.savedAt);
 }
 
-export function saveTemplate(name: string, instance: ComponentInstance): void {
+export function saveTemplate(name: string, instance: ComponentInstance, project?: TemplateProject): void {
   const tempId = `pending-${Math.random().toString(36).slice(2, 10)}`;
   const optimistic: SavedTemplate = {
     id: tempId,
@@ -145,8 +201,11 @@ export function saveTemplate(name: string, instance: ComponentInstance): void {
     savedAt: Date.now(),
     // Deep-clone into a frozen snapshot — later edits to the live instance
     // on the canvas shouldn't retroactively change what's saved.
-    instance: stripSourceStamps(instance),
+    instance: stampRefs(stripSourceStamps(instance), project?.id ?? null),
+    projectId: project?.id ?? null,
+    projectName: project?.name ?? null,
   };
+  optimistic.refs = collectRefs(optimistic.instance, optimistic.projectId ?? null);
   cache = [...cache, optimistic];
   notify();
 
@@ -154,6 +213,7 @@ export function saveTemplate(name: string, instance: ComponentInstance): void {
     name: optimistic.name,
     plugin_id: optimistic.pluginId,
     instance: optimistic.instance,
+    project_id: project?.id ? Number(project.id) : null,
   })
     .then(row => {
       const saved = fromRow(row);
@@ -182,6 +242,8 @@ export async function updateTemplate(
   id: string,
   instance: ComponentInstance,
   name?: string,
+  /** Omit to keep the template's current project; pass `{ id: null }` to detach it. */
+  project?: TemplateProject,
 ): Promise<void> {
   // Saved a moment ago and the server hasn't answered yet: wait for the real id.
   const inFlight = pendingCreates.get(id);
@@ -191,11 +253,15 @@ export async function updateTemplate(
   const previous = cache.find(t => t.id === realId);
   if (!previous) throw new Error('Saved template no longer exists');
 
-  const snapshot = stripSourceStamps(instance);
+  const nextProjectId = project ? project.id : previous.projectId ?? null;
+  const snapshot = stampRefs(stripSourceStamps(instance), nextProjectId);
   const finalName = name?.trim() || previous.name;
   cache = cache.map(t =>
     t.id === realId
-      ? { ...t, name: finalName, pluginId: snapshot.pluginId, instance: snapshot, savedAt: Date.now() }
+      ? {
+          ...t, name: finalName, pluginId: snapshot.pluginId, instance: snapshot, savedAt: Date.now(),
+          ...(project ? { projectId: project.id, projectName: project.name } : {}),
+        }
       : t,
   );
   notify();
@@ -205,6 +271,7 @@ export async function updateTemplate(
       name: finalName,
       plugin_id: snapshot.pluginId,
       instance: snapshot,
+      ...(project ? { project_id: project.id ? Number(project.id) : null } : {}),
     });
     cache = cache.map(t => (t.id === realId ? fromRow(row) : t));
     notify();
@@ -238,27 +305,79 @@ export function getTemplate(id: string): SavedTemplate | null {
   return cache.find(t => t.id === real) ?? null;
 }
 
+export interface CloneOptions {
+  /** Maps an old instance id to its new one. Default: a fresh random id.
+   *  Pass a pure function (e.g. `old => `tpl12-${old}``) to get the SAME ids on
+   *  every run - the builder and the published client then agree on them. */
+  idFor?: (oldId: string) => string;
+}
+
+const randomId = () => Math.random().toString(36).slice(2, 9);
+
+/** Rewrites every reference to a renamed id: exact string matches, ids used as
+ *  a segment of a dotted state path ("global.blocks.<id>.key"), and object keys. */
+function remapIds(value: any, map: Map<string, string>): any {
+  if (typeof value === 'string') {
+    if (map.has(value)) return map.get(value);
+    if (value.includes('.')) {
+      return value.split('.').map(seg => map.get(seg) ?? seg).join('.');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(v => remapIds(v, map));
+  if (value && typeof value === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(value)) out[map.get(k) ?? k] = remapIds(v, map);
+    return out;
+  }
+  return value;
+}
+
 /** Regenerates every id in an instance tree (the instance itself, plus any
  *  nested configs.blocks / configs.components) so dropping the same saved
- *  template twice — or twice into the same page — never produces two
- *  components sharing an id. Also keeps configs.blockId in sync with the
- *  new id, since BlockCanvas reads its own id from there in a couple of
- *  places rather than the instance id directly. */
-export function cloneInstanceWithNewIds(instance: ComponentInstance): ComponentInstance {
+ *  template twice - or twice into the same page - never produces two
+ *  components sharing an id.
+ *
+ *  Every place that REFERENCES one of those ids is rewritten too: configs.blockId,
+ *  the Page's pageMeta.blocks[].id (the state hub registers block state under
+ *  those), saved id refs, and any state path that embeds an id. Without this
+ *  the copy's state is registered under the old ids while the blocks render
+ *  with the new ones, so nothing is bound - which is how a saved page opened from
+ *  a sidebar link loaded empty in the published client. */
+export function cloneInstanceWithNewIds(instance: ComponentInstance, opts: CloneOptions = {}): ComponentInstance {
   const deep: ComponentInstance = JSON.parse(JSON.stringify(instance));
+  const idMap = new Map<string, string>();
+  const next = (old: string) => (opts.idFor ? opts.idFor(old) : randomId());
 
   const assignIds = (inst: ComponentInstance) => {
-    inst.id = Math.random().toString(36).slice(2, 9);
+    const old = inst.id;
+    const fresh = old ? next(old) : randomId();
+    if (old) idMap.set(old, fresh);
+    inst.id = fresh;
     const configs = inst.configs as Record<string, any> | undefined;
     if (configs && typeof configs === 'object') {
-      if ('blockId' in configs) configs.blockId = inst.id;
+      if ('blockId' in configs) {
+        if (configs.blockId && configs.blockId !== old) idMap.set(configs.blockId, fresh);
+        configs.blockId = fresh;
+      }
       if (Array.isArray(configs.blocks)) configs.blocks.forEach((b: ComponentInstance) => assignIds(b));
       if (Array.isArray(configs.components)) configs.components.forEach((c: ComponentInstance) => assignIds(c));
     }
   };
-
   assignIds(deep);
-  return deep;
+
+  const remapped = remapIds(deep, idMap) as ComponentInstance;
+
+  // A Page's metadata id must always equal its pageId (state paths use it).
+  const fix = (inst: any) => {
+    const c = inst?.configs;
+    if (!c || typeof c !== 'object') return;
+    if (inst.pluginId === 'page-plugin' && c.pageMeta && c.pageId) c.pageMeta.id = c.pageId;
+    (c.blocks ?? []).forEach(fix);
+    (c.components ?? []).forEach(fix);
+  };
+  fix(remapped);
+  return remapped;
 }
 
 /** If `pluginIdOrRef` is actually a reference to a saved template (dragged

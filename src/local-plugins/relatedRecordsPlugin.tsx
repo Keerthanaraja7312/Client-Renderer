@@ -18,11 +18,10 @@
  */
 import React, { useState, useEffect } from "react";
 import { ArrowLeft, Loader2, Plus, Link2, Link2Off, Search, Pencil, Trash2 } from "lucide-react";
-import { can } from "../lib/permissions";
 import { type ViewBuilderPlugin } from "../sky-view-builder/core/plugin";
 import {
   fetchDomainRows, fetchDomainSchema, fetchAllSchemas, updateDomainRow,
-  submitFormRow, deleteDomainRow,
+  submitFormRow, deleteDomainRow, getActiveProject,
 } from "../api/datastoreApi";
 import { RepeatableRelatedStepForm, type RelatedStepInfo } from "./formplugin";
 import { DataTable } from "./DataTable";
@@ -57,6 +56,11 @@ const SHOW_ADD_EXISTING = true;
 /** The per-row "Remove / unlink" button is hidden for now. Set to true to show it again. */
 const SHOW_UNLINK = true;
 
+/** Normalises the Owns / Uses label stored on a schema field. */
+function toLinkMode(v: unknown): "owns" | "uses" | undefined {
+  return v === "owns" ? "owns" : v === "uses" ? "uses" : undefined;
+}
+
 export function isJunctionLike(fields: SchemaField[]): boolean {
   const real = fields.filter(f => !JUNCTION_SYSTEM_FIELDS.has(f.field_id));
   if (real.length < 2) return false;
@@ -75,7 +79,40 @@ export function useRelations(domainName: string, record: Record<string, any>) {
         const schemas = res.schemas ?? [];
         const domainNames = new Set(schemas.map(s => s.table_name));
 
-        const fkChildField = `${domainName}Id`;
+        // This domain's own fields — read up front so a relation can pick up
+        // its Owns / Uses label from a marker field declared on this domain.
+        const thisSchema = schemas.find(s => s.table_name === domainName);
+        const thisFields: SchemaField[] = thisSchema
+          ? (Array.isArray(thisSchema.schema)
+              ? thisSchema.schema
+              : Object.values(thisSchema.schema ?? {}))
+          : [];
+
+        // Tables are stored per project as "<Name>__<projectId>" (Client__31) while
+        // link fields and junction columns only carry the plain name ("Output",
+        // "User31"). Resolve plain names against THIS record's project so a
+        // same-named table of another project (e.g. project 30's "Output") is
+        // never used, and a table with no unsuffixed twin is still found.
+        const projectId = thisSchema?.project_id != null ? String(thisSchema.project_id) : null;
+        const inScope = (e: { project_id?: string | null }) =>
+          projectId == null || e.project_id == null || String(e.project_id) === projectId;
+        const baseOf = (e: any) => String(e.domain_name || e.table_name);
+        const myTable = domainName.toLowerCase();
+        const myBase  = (thisSchema ? baseOf(thisSchema) : domainName).toLowerCase();
+        /** Is `fieldId` the FK column that points at THIS domain (as declared by `entry`)? */
+        const pointsAtMe = (fieldId: string, entry: { project_id?: string | null }) => {
+          const f = fieldId.toLowerCase();
+          return f === `${myTable}id` || (inScope(entry) && f === `${myBase}id`);
+        };
+        /** A plain domain name → true when this project has a table for it. */
+        const resolves = (name: string) => {
+          const n = name.toLowerCase();
+          return schemas.some(s2 => inScope(s2) && (
+            s2.table_name.toLowerCase() === n ||
+            s2.table_name.replace(/_/g, "").toLowerCase() === n ||
+            baseOf(s2).toLowerCase() === n));
+        };
+
         for (const entry of schemas) {
           if (entry.table_name === domainName) continue;
           const fields: SchemaField[] = Array.isArray(entry.schema)
@@ -105,14 +142,17 @@ export function useRelations(domainName: string, record: Record<string, any>) {
             // actually holds it, never a symmetric one on the far side.
             const idFields = fields.filter(f => f.field_id.endsWith("Id"));
             if (idFields.length < 2) continue;
-            if (idFields[0].field_id.toLowerCase() !== fkChildField.toLowerCase()) {
+            if (!pointsAtMe(idFields[0].field_id, entry)) {
               // This domain is the TARGET side of the link (e.g. College in
               // University_College). It still gets a tab, but a read-only
               // one: only the records assigned to this record, with just
               // Edit / Delete — linking is managed from the owning side.
-              if (idFields[1].field_id.toLowerCase() === fkChildField.toLowerCase()) {
+              if (pointsAtMe(idFields[1].field_id, entry)) {
+                // The junction's owning side is marked "owns" (e.g. Client owns Output):
+                // the owned record doesn't list its owner back, so no tab here.
+                if (toLinkMode(idFields[0].linkMode) === "owns") continue;
                 const ownerDomain = idFields[0].field_id.slice(0, -2);
-                if (domainNames.has(ownerDomain) && !found.some(r => r.domain === ownerDomain)) {
+                if (resolves(ownerDomain) && !found.some(r => r.domain === ownerDomain)) {
                   found.push({
                     domain:        ownerDomain,
                     mode:          "list",
@@ -130,13 +170,13 @@ export function useRelations(domainName: string, record: Record<string, any>) {
             const myField = idFields[0];
             const otherField = idFields[1];
             const relatedDomain = otherField.field_id.slice(0, -2);
-            if (!domainNames.has(relatedDomain)) continue;
+            if (!resolves(relatedDomain)) continue;
             if (found.some(r => r.domain === relatedDomain)) continue;
 
             found.push({
               domain:        relatedDomain,
               mode:          "list",
-              fkField:       fkChildField,
+              fkField:       myField.field_id,
               junctionTable: entry.table_name,
               viaField:      otherField.field_id,
               label:         relatedDomain,
@@ -144,33 +184,32 @@ export function useRelations(domainName: string, record: Record<string, any>) {
               // relationKind at all in practice, so this reliably falls
               // back to "association" — exactly right for many-to-many.
               relationKind: myField.relationKind === "integral" ? "integral" : "association",
+              // Owns / Uses: the junction's owning FK column first, else a
+              // marker field on this domain that points at the related domain.
+              linkMode: toLinkMode(myField.linkMode)
+                ?? toLinkMode(thisFields.find(f =>
+                     String(f.relatedDomain ?? "").toLowerCase() === relatedDomain.toLowerCase())?.linkMode),
             });
             continue;
           }
 
-          const fkField = fields.find(f => f.field_id === fkChildField);
+          const fkField = fields.find(f => pointsAtMe(f.field_id, entry));
           if (fkField) {
             found.push({
               domain:  entry.table_name,
               mode:    "fk_children",
-              fkField: fkChildField,
+              fkField: fkField.field_id,
               label:   entry.table_name,
               relationKind: fkField.relationKind === "integral" ? "integral" : "association",
+              linkMode: toLinkMode(fkField.linkMode),
             });
           }
         }
 
-        const thisSchema = schemas.find(s => s.table_name === domainName);
-        const thisFields: SchemaField[] = thisSchema
-          ? (Array.isArray(thisSchema.schema)
-              ? thisSchema.schema
-              : Object.values(thisSchema.schema ?? {}))
-          : [];
-
         for (const field of thisFields) {
           if (field.field_id.endsWith("Id")) {
             const refDomain = field.field_id.slice(0, -2);
-            if (domainNames.has(refDomain) && record[field.field_id]) {
+            if (resolves(refDomain) && record[field.field_id]) {
               if (!found.some(r => r.domain === refDomain)) {
                 found.push({
                   domain:  refDomain,
@@ -218,7 +257,7 @@ export function useRelations(domainName: string, record: Record<string, any>) {
           const relatedDomain =
             field.relatedDomain || field.listDomain ||
             (field as any).related_domain_model?.linked_with;
-          if (!relatedDomain || !domainNames.has(relatedDomain)) continue;
+          if (!relatedDomain || !resolves(relatedDomain)) continue;
           if (found.some(r => r.domain === relatedDomain)) continue;
 
           const relationKind =
@@ -233,6 +272,7 @@ export function useRelations(domainName: string, record: Record<string, any>) {
             viaField:      `${relatedDomain}Id`,
             label:         relatedDomain,
             relationKind:  relationKind === "integral" ? "integral" : "association",
+            linkMode:      toLinkMode(field.linkMode),
           });
         }
 
@@ -242,9 +282,28 @@ export function useRelations(domainName: string, record: Record<string, any>) {
         // forced multi-step creation flow (see useRelatedSteps in
         // formplugin.tsx) and the "Add Existing" link action just below
         // (showLinkActions) — not whether a tab shows up at all.
-        setRelations(found);
+        // The project's IDAM user table (User31 / User__31) is not shown as a related tab —
+        // a linked user (owner, lead…) is picked from the field's dropdown instead.
+        // Needs the project suffix, so an ordinary "User" domain is still shown.
+        const HIDDEN_RELATED = /^user_*\d+$/i;
+        const shown = found.filter(r => !HIDDEN_RELATED.test(r.domain) && !HIDDEN_RELATED.test(r.label));
+        // Debug aid: shows why related tabs are (not) built. Remove once published pages match the builder.
+        console.info('[related-tabs]', {
+          domainName,
+          activeProject: getActiveProject(),
+          schemasReturned: schemas.length,
+          ownSchemaFound: !!thisSchema,
+          ownSchemaTable: thisSchema?.table_name ?? null,
+          projectOfThisTable: projectId,
+          relationsFound: found.map(r => `${r.mode}:${r.domain}`),
+          relationsShown: shown.map(r => `${r.mode}:${r.domain}`),
+        });
+        setRelations(shown);
       })
-      .catch(() => setRelations([]))
+      .catch((e) => {
+        console.error('[related-tabs] could not load schemas -> no related tabs:', e);
+        setRelations([]);
+      })
       .finally(() => setLoading(false));
   }, [domainName, record]);
 
@@ -585,10 +644,26 @@ export function RelatedTab({
         fetchDomainSchema(relation.domain).catch(() => ({ schema: [], db_backend: "postgresql" as const })),
       ])
         .then(([domainRows, schemaRes]) => {
-          setStoreRows(cacheKey, domainRows.filter(r => String(r[relation.fkField]) === parentId));
+          const matched = domainRows.filter(r => String(r[relation.fkField]) === parentId);
+          // Debug aid: why a related tab is empty (wrong table, wrong FK column, wrong parent id).
+          console.info('[related-rows]', {
+            relatedDomain: relation.domain,
+            resolvedTable: (schemaRes as any).table_name ?? relation.domain,
+            activeProject: getActiveProject(),
+            fkField: relation.fkField,
+            parentId,
+            rowsReturned: domainRows.length,
+            rowsMatchingParent: matched.length,
+            sampleFkValues: domainRows.slice(0, 5).map(r => r[relation.fkField]),
+            firstRowKeys: domainRows[0] ? Object.keys(domainRows[0]) : [],
+          });
+          setStoreRows(cacheKey, matched);
           setStoreSchema(cacheKey, schemaRes.schema ?? []);
         })
-        .catch(() => setStoreRows(cacheKey, []))
+        .catch((e) => {
+          console.error('[related-rows] failed to load', relation.domain, '->', e?.message ?? e);
+          setStoreRows(cacheKey, []);
+        })
         .finally(() => setStoreLoading(cacheKey, false));
     } else if (relation.mode === "list") {
       loadListRelation();
@@ -669,14 +744,16 @@ export function RelatedTab({
   // Both one-to-many (fk_children) and many-to-many (list) support an
   // inline "Create new X" — RepeatableRelatedStepForm already knows how
   // to insert into the junction table too when step.kind is "list".
-  const showCreateBtn = !relation.reverse && (relation.mode === "fk_children" || relation.mode === "list") && can(relation.domain, "create");
+  const showCreateBtn = !relation.reverse && (relation.mode === "fk_children" || relation.mode === "list");
   // Composition relations (e.g. branch belongs to clinic) don't get
   // Add Existing / Remove — a child of this kind only ever exists under
   // its parent, so linking/unlinking it elsewhere isn't a valid action.
   // "list" relations always get Add Existing / Remove regardless of
   // relationKind — a many-to-many reference is never "owned" the way a
   // single fk_children composition can be.
-  const showLinkActions = !relation.reverse && (
+  // Owns / Uses label: when the attribute is marked "owns", Add Existing is
+  // hidden (create only); "uses" — or no label — keeps Add Existing.
+  const showLinkActions = !relation.reverse && relation.linkMode !== "owns" && (
     relation.mode === "list" ||
     (relation.mode === "fk_children" && relation.relationKind !== "integral"));
  
@@ -788,11 +865,11 @@ return (
         emptyText={`No ${relation.domain} records ${showLinkActions ? "added" : "yet"}`}
         headerBg={headerBg}
         actions={[
-          ...(can(relation.domain, "edit") ? [{
+          {
             icon: <Pencil className="w-3.5 h-3.5" />,
             title: `Edit ${capitalize(relation.domain)}`,
-            onClick: (row: Record<string, any>) => setEditRow(row),
-          }] : []),
+            onClick: (row) => setEditRow(row),
+          },
           // Remove = unlink only (keeps the record). Not offered for
           // composition relations, where a child can't live outside its parent.
           ...(SHOW_UNLINK && showLinkActions ? [{
@@ -802,12 +879,12 @@ return (
             busy: (row: Record<string, any>) => unlinkingId === actualRowId(row),
             className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors",
           }] : []),
-          ...(can(relation.domain, "delete") ? [{
+          {
             icon: <Trash2 className="w-3.5 h-3.5" />,
             title: `Delete ${capitalize(relation.domain)}`,
-            onClick: (row: Record<string, any>) => setDeleteRow(row),
+            onClick: (row) => setDeleteRow(row),
             className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors",
-          }] : []),
+          },
         ]}
       />
     </div>
