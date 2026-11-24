@@ -9,15 +9,14 @@ import { PLUGIN_DRAG_MIME } from "../sky-view-builder/ui/Toolbar";
 import { resolveDroppedTemplate } from "../sky-view-builder/core/templateStore";
 import {
   ComponentSlot, snap, getDefaultComponentSize, DEFAULT_COMPONENT_WIDTH, DEFAULT_COMPONENT_HEIGHT,
-
 } from "./blockplugin";
 
 // ─── Config shape ───────────────────────────────────────────────────────────
 
 /** Where the tab strip sits: a row across the top, or a column down the left. */
-type TabOrientation = "horizontal" | "vertical";
+export type TabOrientation = "horizontal" | "vertical";
 
-interface DomainTabsConfigs {
+export interface DomainTabsConfigs {
   tabCount?: number;
   tabDomains?: Record<string, string>;
 
@@ -44,33 +43,40 @@ interface DomainTabsConfigs {
   _blockId?: string;
 }
 
-interface PerTabStyle {
-  /** This tab's own content-area background — independent per tab, so
-   *  e.g. a "Patient" tab can be tinted differently from a "Doctor" tab. */
+export interface PerTabStyle {
+  /** This tab's own content-area background — independent per tab. */
   bg?: string;
   /** This tab's heading/label text color (the text on its tab button). */
   headingColor?: string;
 }
 
-interface TabStylingConfig {
+export interface TabStylingConfig {
   /** Background behind the whole tab strip. */
   barBg?: string;
   /** Background highlight of whichever tab is currently active. */
   activeBg?: string;
+  /** Text color of whichever tab is currently active. Wins over a tab's own
+   *  headingColor while that tab is active. */
+  activeTextColor?: string;
   /** Color of the little underline indicator beneath the active tab. */
   indicatorColor?: string;
-  /** Per-tab overrides, keyed by tab index (same keys as tabDomains/tabLabels). */
+  /** Per-tab overrides. Keyed by tab index in normal mode (same keys as
+   *  tabDomains/tabLabels) and by the tab's own key in external mode. */
   perTab?: Record<string, PerTabStyle>;
+}
+
+/** A tab supplied by a host component (e.g. the Data grid's record detail view).
+ *  When `tabsOverride` is passed to DomainTabsCanvas, the host owns the tab list
+ *  and the tab content; Group Tabs only draws the bar and the styling. */
+export interface ExternalTab {
+  key: string;
+  label: string;
+  removable?: boolean;
 }
 
 const DEFAULT_TAB_COUNT = 3;
 
 // ─── Orientation cascade ─────────────────────────────────────────────────────
-// A Group tabs dropped into another one starts with its parent's orientation
-// (vertical parent → vertical, otherwise horizontal). When
-// the orientation of any Group tabs is changed afterwards, that value is pushed
-// down to every Group tabs nested inside it, at any depth. Returns the updated
-// list plus whether anything actually changed (so callers can skip no-op writes).
 
 function cascadeOrientation(
   components: ComponentInstance[],
@@ -92,8 +98,7 @@ function cascadeOrientation(
 }
 
 // Each Group tabs publishes its orientation here so a Group tabs nested inside
-// it can match it the first time it appears (however it got there — drop,
-// template, paste). null = no Group tabs above, i.e. top level.
+// it can match it the first time it appears. null = top level.
 const ParentOrientationContext = createContext<TabOrientation | null>(null);
 
 function useAllDomainNames() {
@@ -115,7 +120,7 @@ function useAllDomainNames() {
   return { domainNames, loading };
 }
 
-function TabDomainsSetting({
+export function TabDomainsSetting({
   value, onChange, configs,
 }: {
   value?: Record<string, string>;
@@ -197,15 +202,9 @@ function TabLabelsSetting({
   );
 }
 
-// ─── Orientation setting — a two-way switch (Horizontal | Vertical) shown in
-// the settings panel. Written as a custom setting, the same way Tab Labels
-// and Tab Styling are, so it needs nothing the settings panel doesn't already
-// support.
-//
-// Changing this on a Group tabs also applies the new value to every Group tabs
-// nested inside it (see cascadeOrientation / the effect in DomainTabsCanvas).
+// ─── Orientation setting — a two-way switch (Horizontal | Vertical) ──────────
 
-function TabOrientationSetting({
+export function TabOrientationSetting({
   value, onChange,
 }: {
   value?: TabOrientation;
@@ -239,13 +238,9 @@ function TabOrientationSetting({
   );
 }
 
+// ─── Color field — swatch + hex input + reset ────────────────────────────────
 
-
-// ─── Color field — swatch + hex input, same pattern VisualStyleSettings
-// uses, plus a reset (✕) so a per-tab override can fall back to the
-// shared theme default instead of being stuck once set.
-
-function ColorField({
+export function ColorField({
   label, value, placeholder, onChange,
 }: {
   label: string;
@@ -313,7 +308,12 @@ function TabStylingSetting({
       <div className="flex flex-col gap-3 bg-secondary/20 rounded-lg p-3 border border-border">
         <p className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground/50">Tab Bar</p>
         <ColorField label="Bar Background" placeholder="#1c212b" value={cur.barBg} onChange={v => set({ barBg: v })} />
+      </div>
+
+      <div className="flex flex-col gap-3 bg-secondary/20 rounded-lg p-3 border border-border">
+        <p className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground/50">Active Tab</p>
         <ColorField label="Active Tab Background" placeholder="#1a3a30" value={cur.activeBg} onChange={v => set({ activeBg: v })} />
+        <ColorField label="Active Tab Text" placeholder="#34d399" value={cur.activeTextColor} onChange={v => set({ activeTextColor: v })} />
         <ColorField label="Active Indicator" placeholder="#34d399" value={cur.indicatorColor} onChange={v => set({ indicatorColor: v })} />
       </div>
 
@@ -345,8 +345,7 @@ function TabContent({
   isPreview?: boolean;
   selectedId?: string | null;
   onSelect?: (id: string) => void;
-  /** This tab's own background override, from tabStyling.perTab[index].bg —
-   *  falls back to the shared theme background when unset. */
+  /** This tab's own background override, from tabStyling.perTab[index].bg. */
   bgColor?: string;
 }) {
   const [isDragOver, setIsDragOver] = useState(false);
@@ -427,46 +426,53 @@ function TabContent({
 
 // ─── Canvas: the tab bar itself ──────────────────────────────────────────────
 
-function DomainTabsCanvas({
+export function DomainTabsCanvas({
   configs, updateConfigs, isPreview, selectedId, onSelect,
+  tabsOverride, renderTabContent, onAddTab, onRemoveTab,
 }: {
   configs: DomainTabsConfigs;
   updateConfigs?: (c: Partial<DomainTabsConfigs> | ((prev: DomainTabsConfigs) => Partial<DomainTabsConfigs>)) => void;
   isPreview?: boolean;
   selectedId?: string | null;
   onSelect?: (id: string) => void;
+  /** External mode: the host supplies the tab list. */
+  tabsOverride?: ExternalTab[];
+  /** External mode: the host draws each tab's content. */
+  renderTabContent?: (tab: ExternalTab) => React.ReactNode;
+  /** External mode: "+" was clicked — host should append a tab to the end. */
+  onAddTab?: () => void;
+  /** External mode: "x" was clicked on a removable tab. */
+  onRemoveTab?: (key: string) => void;
 }) {
-  const tabCount = Math.max(1, Number(configs.tabCount) || DEFAULT_TAB_COUNT);
+  const external = !!tabsOverride;
+
+  const tabCount = external
+    ? Math.max(1, tabsOverride!.length)
+    : Math.max(1, Number(configs.tabCount) || DEFAULT_TAB_COUNT);
   const tabDomains = configs.tabDomains ?? {};
   const tabLabels = configs.tabLabels ?? {};
   const allComponents = configs.components ?? [];
   const tabStyling = configs.tabStyling ?? {};
 
   // ── Orientation ────────────────────────────────────────────────────────────
-  // Each Group tabs renders from its own saved value (default horizontal).
   const orientation: TabOrientation =
     configs.tabOrientation === "vertical" ? "vertical" : "horizontal";
   const isVertical = orientation === "vertical";
 
-  // First appearance inside another Group tabs: take the parent's orientation
-  // (same, never opposite). Runs once per component, tracked by
-  // _orientationInit, so it can't override a later manual change.
+  // First appearance inside another Group tabs: take the parent's orientation.
   const parentOrientation = useContext(ParentOrientationContext);
   useEffect(() => {
-    if (isPreview || !parentOrientation || configs._orientationInit) return;
+    if (isPreview || external || !parentOrientation || configs._orientationInit) return;
     updateConfigs?.({ tabOrientation: parentOrientation, _orientationInit: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // When THIS Group tabs' orientation is changed (e.g. from the settings
-  // switch), push the new value down to every Group tabs nested inside it, at
-  // any depth. The ref starts at the current value, so mounting or loading a
-  // saved design never overwrites anything — only a real change cascades.
+  // When THIS Group tabs' orientation changes, push it down to nested ones.
   const prevOrientation = useRef(orientation);
   useEffect(() => {
     if (prevOrientation.current === orientation) return;
     prevOrientation.current = orientation;
-    if (isPreview) return;
+    if (isPreview || external) return;
     updateConfigs?.((prev: DomainTabsConfigs) => {
       const { list, changed } = cascadeOrientation(prev.components ?? [], orientation);
       return changed ? { components: list } : {};
@@ -475,51 +481,48 @@ function DomainTabsCanvas({
   }, [orientation, isPreview]);
 
   const perTabStyle = tabStyling.perTab ?? {};
-  const tabs = Array.from({ length: tabCount }, (_, i) => ({
-    index: i,
-    domain: tabDomains[String(i)] ?? "",
-    // Custom label wins if the person typed one; otherwise fall back to
-    // the bound domain name, then a plain "Tab N" placeholder.
-    label: tabLabels[String(i)]?.trim() || tabDomains[String(i)] || `Tab ${i + 1}`,
-  }));
+
+  // Per-tab styles are looked up by `key`: the index string in normal mode,
+  // the host's real tab key in external mode.
+  const tabs = external
+    ? tabsOverride!.map((t, i) => ({
+        index: i,
+        key: t.key,
+        domain: "",
+        label: t.label,
+        removable: !!t.removable,
+      }))
+    : Array.from({ length: tabCount }, (_, i) => ({
+        index: i,
+        key: String(i),
+        domain: tabDomains[String(i)] ?? "",
+        // Custom label wins; otherwise the bound domain name, then "Tab N".
+        label: tabLabels[String(i)]?.trim() || tabDomains[String(i)] || `Tab ${i + 1}`,
+        removable: true,
+      }));
 
   const [activeIndex, setActiveIndex] = useState(0);
+  // The host can shrink its tab list (e.g. another record opened), so clamp.
+  const safeActiveIndex = Math.min(activeIndex, Math.max(0, tabs.length - 1));
+  const activeTabItem = tabs[safeActiveIndex];
 
-  // Inline rename: which tab's label is currently an input box, and what's
-  // been typed so far. Only ever set while designing (never in preview).
+  // Inline rename state (only used while designing).
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
-  // Set once an edit has been saved or cancelled, so the blur that follows
-  // when the input disappears doesn't save it a second time (or undo a cancel).
   const skipCommit = useRef(false);
 
-  // Filter the flat array down to just this tab's own components, by the
-  // tabIndex tag each one carries — switching tabs shows only the matching
-  // subset, same visual result as before, just sourced from one shared
-  // array instead of a per-tab grouped one.
-  const activeComponents = allComponents.filter(c => ((c.configs as any)?.tabIndex ?? 0) === activeIndex);
+  const activeComponents = allComponents.filter(c => ((c.configs as any)?.tabIndex ?? 0) === safeActiveIndex);
 
   const pageId  = configs._pageId  || "page";
   const blockId = configs._blockId || "block";
 
-  // Adds a dropped component to the flat array, tagged with the active
-  // tab's index. Same default-size lookup BlockCanvas uses, so a Data Grid
-  // dropped into a tab starts at the same size a Data Grid dropped into a
-  // Block would.
-  //
   function addComponentToActiveTab(pluginId: string, dropX: number, dropY: number) {
-    // A saved template dropped into a tab: clone it (fresh ids), position
-    // it the same way a fresh drop would be, and tag it with this tab's
-    // index — same shape as the non-template path below either way.
     const template = resolveDroppedTemplate(pluginId);
     const effectivePluginId = template ? template.pluginId : pluginId;
     const defaultSize = getDefaultComponentSize(effectivePluginId);
     const x = snap(Math.max(0, dropX - defaultSize.width / 2));
     const y = snap(Math.max(0, dropY - 20));
 
-    // A Group tabs dropped in here starts with this one's orientation:
-    // vertical parent → vertical child, otherwise horizontal. Changing an
-    // orientation later cascades downward.
     const nestedOrientation: Record<string, unknown> =
       effectivePluginId === "domain-tabs"
         ? { tabOrientation: orientation === "vertical" ? "vertical" : "horizontal", _orientationInit: true }
@@ -533,14 +536,14 @@ function DomainTabsCanvas({
             x, y,
             width: (template.configs as any)?.width || defaultSize.width,
             height: (template.configs as any)?.height || defaultSize.height,
-            tabIndex: activeIndex,
+            tabIndex: safeActiveIndex,
             ...nestedOrientation,
           },
         }
       : {
           id: Math.random().toString(36).substring(2, 7),
           pluginId,
-          configs: { x, y, width: defaultSize.width, height: defaultSize.height, tabIndex: activeIndex, ...nestedOrientation },
+          configs: { x, y, width: defaultSize.width, height: defaultSize.height, tabIndex: safeActiveIndex, ...nestedOrientation },
           query: {},
           componentDataSchema: {},
           dataSourceId: null,
@@ -552,13 +555,10 @@ function DomainTabsCanvas({
     }));
   }
 
-  // Both update/remove operate by the component's own id against the flat
-  // array — not by index into the filtered view, which would silently
-  // point at the wrong item as soon as more than one tab has components.
   function updateComponentInActiveTab(_i: number, u: ComponentInstance | ((prev: ComponentInstance) => ComponentInstance)) {
     updateConfigs?.((prev: DomainTabsConfigs) => {
       const list = prev.components ?? [];
-      const target = list.filter(c => ((c.configs as any)?.tabIndex ?? 0) === activeIndex)[_i];
+      const target = list.filter(c => ((c.configs as any)?.tabIndex ?? 0) === safeActiveIndex)[_i];
       if (!target) return {};
       return {
         components: list.map(c =>
@@ -571,7 +571,7 @@ function DomainTabsCanvas({
   function removeComponentFromActiveTab(_i: number) {
     updateConfigs?.((prev: DomainTabsConfigs) => {
       const list = prev.components ?? [];
-      const target = list.filter(c => ((c.configs as any)?.tabIndex ?? 0) === activeIndex)[_i];
+      const target = list.filter(c => ((c.configs as any)?.tabIndex ?? 0) === safeActiveIndex)[_i];
       if (!target) return {};
       return { components: list.filter(c => c.id !== target.id) };
     });
@@ -586,10 +586,6 @@ function DomainTabsCanvas({
     setEditingIndex(index);
   }
 
-  // Saves the typed name into tabLabels right away (same place the "Tab
-  // Labels" settings field writes to, so the two always agree). Clearing
-  // the box removes the custom name, so the tab falls back to its domain
-  // name or "Tab N".
   function commitEdit() {
     if (skipCommit.current || editingIndex === null) return;
     skipCommit.current = true;
@@ -609,11 +605,13 @@ function DomainTabsCanvas({
     setEditingIndex(null);
   }
 
-  // Appends a blank tab right after whatever tabs already exist — same
-  // effect as bumping "Number of Tabs" in settings, just done inline from
-  // the "+". The new tab is selected and its name is opened for typing
-  // straight away, so it can be named in the same motion.
   function addTab() {
+    // External mode: the host owns the tab list; the new tab lands at the end.
+    if (external) {
+      onAddTab?.();
+      setActiveIndex(tabs.length);
+      return;
+    }
     const newIndex = tabCount;
     updateConfigs?.((prev: DomainTabsConfigs) => {
       const count = Math.max(1, Number(prev.tabCount) || DEFAULT_TAB_COUNT);
@@ -623,10 +621,6 @@ function DomainTabsCanvas({
     startEdit(newIndex, `Tab ${newIndex + 1}`);
   }
 
-  // Removes a tab and reindexes everything after it — tabs, their labels,
-  // and any dropped components tagged with that tabIndex — so nothing
-  // shifts to the wrong tab once the gap closes. Always keeps at least
-  // one tab.
   function removeTab(index: number) {
     cancelEdit();
     updateConfigs?.((prev: DomainTabsConfigs) => {
@@ -668,15 +662,15 @@ function DomainTabsCanvas({
     });
   }
 
+  const activeBgColor = activeTabItem ? perTabStyle[activeTabItem.key]?.bg : undefined;
+
   return (
     <ParentOrientationContext.Provider value={orientation}>
       <div className={`flex h-full ${isVertical ? "flex-row" : "flex-col"}`}>
-        {/* Tab bar — label is the domain name bound to that tab, or a
-            placeholder ("Tab N") until one's picked in settings. Colors here
-            come from tabStyling (a dedicated settings field), independent of
-            the shared Visual Style panel — falls back to the theme defaults
-            (bg-primary/10, text-foreground, etc.) whenever unset. */}
+        {/* Tab bar. Colors come from tabStyling, independent of the shared
+            Visual Style panel — falls back to theme defaults when unset. */}
         <div
+          role="tablist"
           className={
             isVertical
               ? "flex flex-col items-stretch border-r border-border py-2 gap-1 overflow-y-auto shrink-0 w-40"
@@ -684,39 +678,60 @@ function DomainTabsCanvas({
           }
           style={tabStyling.barBg ? { backgroundColor: tabStyling.barBg } : undefined}>
           {tabs.map(tab => {
-            const style = perTabStyle[String(tab.index)] ?? {};
-            const active = activeIndex === tab.index;
-            const editing = editingIndex === tab.index;
+            const style = perTabStyle[tab.key] ?? {};
+            const active = safeActiveIndex === tab.index;
+
+            // Normal mode: removable when more than one tab and not previewing.
+            // External mode: only tabs the host marked removable (e.g. manual tabs).
+            const canRemove = external
+              ? tab.removable
+              : !isPreview && tabs.length > 1;
+
+            // Active text color wins over the tab's own heading color.
+            const textColor = active
+              ? (tabStyling.activeTextColor || style.headingColor)
+              : style.headingColor;
+
             return (
-              <div key={tab.index} className={`relative flex items-center group shrink-0 ${isVertical ? "w-full" : ""}`}>
+              <div key={tab.key} className={`relative flex items-center group shrink-0 ${isVertical ? "w-full" : ""}`}>
                 <button
+                  role="tab"
+                  aria-selected={active}
                   onClick={() => setActiveIndex(tab.index)}
-                  className={`relative px-3 py-2.5 text-xs font-semibold whitespace-nowrap capitalize transition-all duration-200 ${
+                  className={`relative px-3 py-2.5 text-xs whitespace-nowrap capitalize transition-all duration-200 ${
                     isVertical ? "w-full text-left rounded-l-lg border-r-2 -mr-px" : "rounded-t-lg border-b-2 -mb-px"
                   } ${
                     active
-                      ? "border-primary shadow-[0_-1px_0_0_rgba(0,0,0,0.02)]"
-                      : "border-transparent text-muted-foreground hover:text-foreground hover:bg-secondary/50"
-                  } ${tabs.length > 1 ? "pr-6" : ""}`}
+                      ? "font-bold border-primary bg-primary/15 text-primary shadow-sm"
+                      : "font-medium border-transparent text-muted-foreground opacity-70 hover:opacity-100 hover:text-foreground hover:bg-secondary/50"
+                  } ${canRemove ? "pr-6" : ""}`}
                   style={{
                     ...(active && tabStyling.activeBg ? { backgroundColor: tabStyling.activeBg } : {}),
-                    ...(style.headingColor ? { color: style.headingColor } : (active ? { color: "var(--color-foreground)" } : {})),
+                    ...(textColor ? { color: textColor } : {}),
                   }}>
                   {tab.label}
                   {active && (
                     <span
                       className={`pointer-events-none absolute rounded-full bg-primary ${
-                        isVertical ? "inset-y-2 -right-[2px] w-[2px]" : "inset-x-2 -bottom-[2px] h-[2px]"
+                        isVertical ? "inset-y-1.5 -right-[3px] w-[3px]" : "inset-x-2 -bottom-[3px] h-[3px]"
                       }`}
                       style={tabStyling.indicatorColor ? { backgroundColor: tabStyling.indicatorColor } : undefined}
                     />
                   )}
                 </button>
-                {tabs.length > 1 && !isPreview && (
+                {canRemove && (
                   <button
                     type="button"
                     title={`Remove ${tab.label}`}
-                    onClick={(e) => { e.stopPropagation(); removeTab(tab.index); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (external) {
+                        onRemoveTab?.(tab.key);
+                        setActiveIndex(p => (p === tab.index ? 0 : p > tab.index ? p - 1 : p));
+                        return;
+                      }
+                      removeTab(tab.index);
+                    }}
                     className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 p-0.5 rounded text-muted-foreground/40 hover:text-destructive transition-opacity">
                     <X className="w-3 h-3" />
                   </button>
@@ -725,7 +740,7 @@ function DomainTabsCanvas({
             );
           })}
 
-          {!isPreview && (
+          {(!isPreview || external) && (
             <button
               type="button"
               onClick={addTab}
@@ -736,23 +751,33 @@ function DomainTabsCanvas({
           )}
         </div>
 
-        {/* Active tab's content — bound domain's grid (if any) and this
-            tab's drop zone are now the SAME element (see TabContent), so
-            there's no gap for a drop to fall through and escape to a parent
-            block/page's own drag mechanism. */}
-        <TabContent
-          key={activeIndex}
-          components={activeComponents}
-          onAddComponent={addComponentToActiveTab}
-          onUpdateComponent={updateComponentInActiveTab}
-          onRemoveComponent={removeComponentFromActiveTab}
-          pageId={pageId}
-          blockId={blockId}
-          isPreview={isPreview}
-          selectedId={selectedId}
-          onSelect={onSelect}
-          bgColor={perTabStyle[String(activeIndex)]?.bg}
-        />
+        {/* Active tab's content. External mode: the host draws it. Normal mode:
+            the tab's own drop zone for other components. */}
+        {external ? (
+          <div
+            className="flex-1 min-w-0 min-h-0 overflow-y-auto p-5"
+            style={activeBgColor ? { backgroundColor: activeBgColor } : undefined}>
+            {activeTabItem ? renderTabContent?.({
+              key: activeTabItem.key,
+              label: activeTabItem.label,
+              removable: activeTabItem.removable,
+            }) : null}
+          </div>
+        ) : (
+          <TabContent
+            key={safeActiveIndex}
+            components={activeComponents}
+            onAddComponent={addComponentToActiveTab}
+            onUpdateComponent={updateComponentInActiveTab}
+            onRemoveComponent={removeComponentFromActiveTab}
+            pageId={pageId}
+            blockId={blockId}
+            isPreview={isPreview}
+            selectedId={selectedId}
+            onSelect={onSelect}
+            bgColor={activeBgColor}
+          />
+        )}
       </div>
     </ParentOrientationContext.Provider>
   );
@@ -812,8 +837,6 @@ export const DomainTabsPlugin: ViewBuilderPlugin<DomainTabsConfigs, Record<strin
     //   component: TabDomainsSetting,
     // },
     {
-      // Orientation of this Group tabs. Changing it also applies the same
-      // value to every Group tabs nested inside it.
       field_id: "tabOrientation",
       label: "Tab Orientation",
       type: "custom",

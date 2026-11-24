@@ -344,6 +344,9 @@ function DetailView({
   const { relations, loading: loadingRel } = useRelations(domainName, record);
   const [activeTab, setActiveTab]   = useState<string>("details");
   const [allRows] = useState<Record<string, Record<string, any>[]>>({});
+  // A row clicked inside a related tab (e.g. an Output under a Client) opens
+  // that record's own detail view — with its own tabs — in place of this one.
+  const [drill, setDrill] = useState<{ domain: string; row: Record<string, any> } | null>(null);
   const [domainSchema, setDomainSchema] = useState<SchemaField[]>([]);
 
 const recordId     = String(record.id ?? "");
@@ -381,6 +384,18 @@ const recordId     = String(record.id ?? "");
     tabConfig.find(c => c.key === t.key)?.label?.trim() || t.defaultLabel;
 
   const { headerBg } = useThemeColors();
+
+  if (drill) {
+    return (
+      <DetailView
+        key={`${drill.domain}:${String(drill.row.id ?? "")}`}
+        record={drill.row}
+        domainName={drill.domain}
+        versioned={false}
+        onBack={() => setDrill(null)}
+      />
+    );
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -482,6 +497,7 @@ const recordId     = String(record.id ?? "");
               record={record}
               allRows={allRows}
               parentDomain={domainName}
+              onOpenRecord={(domain, row) => setDrill({ domain, row })}
             />
           ) : null;
         })}

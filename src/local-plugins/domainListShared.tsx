@@ -52,6 +52,11 @@ export interface RelationInfo {
   relationKind: "integral" | "association";
   /** Target side of a many-to-many link: tab is read-only (Edit / Delete only). */
   reverse?: boolean;
+  /**
+   * Owns / Uses label set on the attribute in Schema Inspector (metadata only).
+   * "owns" → "Add Existing" is hidden; "uses" (or missing) → it is shown.
+   */
+  linkMode?: "owns" | "uses";
 }
 
 // ─── Row helpers ────────────────────────────────────────────────────────────
