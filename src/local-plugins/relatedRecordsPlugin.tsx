@@ -286,7 +286,12 @@ export function useRelations(domainName: string, record: Record<string, any>) {
         // a linked user (owner, lead…) is picked from the field's dropdown instead.
         // Needs the project suffix, so an ordinary "User" domain is still shown.
         const HIDDEN_RELATED = /^user_*\d+$/i;
-        const shown = found.filter(r => !HIDDEN_RELATED.test(r.domain) && !HIDDEN_RELATED.test(r.label));
+        // The IDAM user table itself (User__14, User__11_1 …) shows only its Details —
+        // the Task / Output links that point AT a user are not listed on the user's record.
+        const isIdamUserTable = /^user__(?:\d+|np)(?:_\d+)?$/i.test(domainName);
+        const shown = isIdamUserTable
+          ? []
+          : found.filter(r => !HIDDEN_RELATED.test(r.domain) && !HIDDEN_RELATED.test(r.label));
         // Debug aid: shows why related tabs are (not) built. Remove once published pages match the builder.
         console.info('[related-tabs]', {
           domainName,
@@ -558,12 +563,14 @@ function RelatedRowEditor({
 // ─── Related Grid Tab — one relation's own data ─────────────────────────────
 
 export function RelatedTab({
-  relation, record, allRows, parentDomain,
+  relation, record, allRows, parentDomain, onOpenRecord,
 }: {
   relation: RelationInfo;
   record: Record<string, any>;
   allRows: Record<string, Record<string, any>[]>;
   parentDomain: string;
+  /** When given, clicking a row opens that related record's own detail view. */
+  onOpenRecord?: (domain: string, row: Record<string, any>) => void;
 }) {
   const parentId = String(record.id ?? "");
 
@@ -860,6 +867,7 @@ return (
       <DataTable
         columns={cols.map(k => ({ key: k }))}
         rows={rows}
+        onRowClick={onOpenRecord ? (row) => onOpenRecord(relation.domain, row) : undefined}
         indexLabel="#"
         indexValue={(_row, i) => i + 1}
         emptyText={`No ${relation.domain} records ${showLinkActions ? "added" : "yet"}`}
@@ -899,7 +907,7 @@ return (
 
 export function RelatedRecordsGroup({
   relations, record, parentDomain, allRows,
-  activeRelation, onActiveRelationChange,
+  activeRelation, onActiveRelationChange, onOpenRecord,
 }: {
   relations: RelationInfo[];
   record: Record<string, any>;
@@ -907,6 +915,7 @@ export function RelatedRecordsGroup({
   allRows: Record<string, Record<string, any>[]>;
   activeRelation: string;
   onActiveRelationChange: (key: string) => void;
+  onOpenRecord?: (domain: string, row: Record<string, any>) => void;
 }) {
   if (relations.length === 0) return null;
 
@@ -941,6 +950,7 @@ export function RelatedRecordsGroup({
             record={record}
             allRows={allRows}
             parentDomain={parentDomain}
+            onOpenRecord={onOpenRecord}
           />
         ) : null;
       })}
