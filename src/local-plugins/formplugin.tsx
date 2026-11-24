@@ -3,7 +3,7 @@ import {
   ClipboardList, Loader2, CheckCircle2, AlertCircle,
   Send, Database, Type, Hash, Calendar,
   ToggleLeft, AlignLeft, Link2, Eye, X, ShieldCheck, RefreshCw,
-  Users, FileText,
+  Users, FileText, ArrowLeft, Plus,
 } from 'lucide-react';
 import { type ViewBuilderPlugin } from '../sky-view-builder/core/plugin';
 import {
@@ -16,9 +16,12 @@ import {
   createDomain,
   fetchAllSchemas,
   normalizeSchemaField,
+  resolveTableName,
   type BackendSchemaField,
+  type BackendSchemaEntry,
 } from '../api/datastoreApi';
 import { fetchRolesForDomain } from '../api/rolesApi';
+import { getCurrentProjectId } from '../sky-view-builder/core/projectStore';
 // At the top of formplugin.tsx, replace the imports:
 import { withDbMultiLang, useFieldTranslations, useAppLanguage } from '../sky-view-builder/components/withDbMultiLang';
 import { LanguageSwitcher } from '../sky-view-builder/components/LanguageSwitcher';
@@ -27,7 +30,6 @@ import formMultiLang from './form.multilang.json';
 import { VisualStyleProvider, useVisualStyle } from '../sky-view-builder/styles/VisualStyleProvider';
 import { VisualStyleSettings } from '../sky-view-builder/styles/VisualStyleSettings';
 import type { VisualStyleConfig } from '../sky-view-builder/styles/visualStyles';
-import { can } from '../lib/permissions';
 // ─── Config type ──────────────────────────────────────────────────────────────
 
 type FormConfigs = {
@@ -83,6 +85,7 @@ function isMultiCardinality(f: BackendSchemaField): boolean {
  * (comma-separated) and be submitted as an array.
  */
 function isMultiValueField(f: BackendSchemaField): boolean {
+  if (f.type === 'domain_model') return false;
   return isMultiCardinality(f) && f.type !== 'list' && f.type !== 'relation' && !getRelatedDomainName(f);
 }
 
@@ -104,8 +107,43 @@ export function isDomainChoiceField(f: BackendSchemaField): boolean {
   return getChoiceDomains(f).length > 1;
 }
 
+/**
+ * A field whose type is "domain_model" and that points at exactly ONE other
+ * domain (e.g. Output_Task.TaskId → Task). It renders inline as a dropdown fed
+ * with that domain's records — single-select for cardinality "one", multi-select
+ * for cardinality "many"/"list". It never becomes a separate wizard step.
+ */
+function getRefDomain(f: BackendSchemaField): string | null {
+  if (isDomainChoiceField(f)) return null; // several domains → domain-choice picker
+  if (f.type !== 'domain_model') {
+    // Backend stores relations as plain "text" + relatedDomain. A SINGLE
+    // (non-list) link whose column lives on this table (e.g. Teams.lead →
+    // Userss) is a dropdown of that domain's records. "…Id" columns are
+    // handled by the foreign-key dropdown, "integral" ones are child links.
+    const rd = getRelatedDomainName(f);
+    if (!rd || isMultiCardinality(f) || f.type === 'list' || f.type === 'relation') return null;
+    if ((f as any).relationKind === 'integral') return null;
+    if (String(f.field_id ?? '').endsWith('Id')) return null;
+    return rd;
+  }
+  const named = getRelatedDomainName(f);
+  if (named) return named;
+  // Fallback for junction-style columns such as "TaskId" → "Task"
+  const id = String(f.field_id ?? '');
+  return id.length > 2 && id.endsWith('Id') ? id.slice(0, -2) : null;
+}
+
+export function isDomainRefField(f: BackendSchemaField): boolean {
+  return !!getRefDomain(f);
+}
+
+function isMultiRefField(f: BackendSchemaField): boolean {
+  return isDomainRefField(f) && isMultiCardinality(f);
+}
+
 function isListRelationField(f: BackendSchemaField): boolean {
   if (isDomainChoiceField(f)) return false; // a picker column, never a hidden "list" relation
+  if (isDomainRefField(f)) return false;    // inline dropdown / multi-select instead
   if (isMultiValueField(f)) return false;
   return f.type === 'list' || isMultiCardinality(f);
 }
@@ -259,6 +297,29 @@ function FieldIcon({ type, datasource }: { type: string; datasource?: string }) 
 }
 const VERSIONING_SYSTEM_FIELDS = new Set(['versionOf']);
 
+// ─── TEMPORARY link overrides ────────────────────────────────────────────────
+// The backend schema for these tables stores the linked fields as plain "text"
+// with no relatedDomain (the link lives only in the domain-model configurator),
+// so the form cannot tell they are links. Until "Save to Backend" persists
+// `relatedDomain` on the field, declare them here: <table_name> → <field_id>.
+// Remove an entry once the backend schema carries relatedDomain for it.
+const LINK_OVERRIDES: Record<string, Record<string, { domain: string; many?: boolean }>> = {
+  Output__31: { owner:   { domain: 'User31' } },
+  Task__31:   { lead:    { domain: 'User31' },
+                members: { domain: 'User31', many: true } },
+};
+
+function applyLinkOverrides(table: string, fields: BackendSchemaField[]): BackendSchemaField[] {
+  const ov = LINK_OVERRIDES[table];
+  if (!ov) return fields;
+  return fields.map(f => {
+    const o = ov[f.field_id];
+    // never override a field the backend already describes as a link
+    if (!o || getRelatedDomainName(f)) return f;
+    return { ...(f as any), type: 'domain_model', relatedDomain: o.domain, cardinality: o.many ? 'many' : 'one' } as BackendSchemaField;
+  });
+}
+
 // ─── Hooks ───────────────────────────────────────────────────────────────────
 
 function useFormSchema(dataSourceId: string | number | null | undefined, refreshKey = 0) {
@@ -290,6 +351,7 @@ function useFormSchema(dataSourceId: string | number | null | undefined, refresh
       }
 
       safeSchema = safeSchema.map(normalizeSchemaField);
+      safeSchema = applyLinkOverrides(result.table_name ?? String(dataSourceId), safeSchema);
       if (import.meta.env.DEV) console.debug('[form] schema for', String(dataSourceId), safeSchema);
       setSchema(safeSchema);
       setDbBackend(result.db_backend);
@@ -305,7 +367,83 @@ function useFormSchema(dataSourceId: string | number | null | undefined, refresh
 return { schema, dbBackend, versioned, loading, error };
 }
 
-function useLinkedOptions(tableName: string | null | undefined) {
+// ─── Resolve a linked-domain name to the right table ─────────────────────────
+// A link field only stores a NAME ("Output"). Several domain models can match
+// that name — same name in another project, different casing, or another table
+// whose label is "Output" — and the dropdown used to read whichever one the
+// name happened to hit. Resolve it against the registered schemas instead and
+// prefer the table in the SAME project / module as the form's own table.
+let schemaListCache: { at: number; list: Promise<BackendSchemaEntry[]> } | null = null;
+function loadSchemaList(): Promise<BackendSchemaEntry[]> {
+  if (!schemaListCache || Date.now() - schemaListCache.at > 30_000) {
+    const list = fetchAllSchemas()
+      .then(r => (Array.isArray(r?.schemas) ? r.schemas : []))
+      .catch(() => { schemaListCache = null; return [] as BackendSchemaEntry[]; });
+    schemaListCache = { at: Date.now(), list };
+  }
+  return schemaListCache.list;
+}
+
+/**
+ * Table a link field should read from, or null when the project has none.
+ * Domain models of ANOTHER project are never used: if the form's own table
+ * belongs to a project, a same-named table in a different project is ignored
+ * (so a form can't silently read another project's "Output").
+ */
+async function resolveDomainTable(name: string, ownTable?: string | number | null): Promise<string | null> {
+  const list = await loadSchemaList();
+  if (list.length === 0) return name;
+  const lc = name.trim().toLowerCase();
+  // the form's own table may itself be given as a plain name ("Output") — map it to this project's table first
+  const ownName = ownTable != null ? await resolveTableName(String(ownTable)) : null;
+  const own = ownName != null ? list.find(s => s.table_name === ownName) : undefined;
+  const same = (a?: string | null, b?: string | null) => a != null && b != null && String(a) === String(b);
+
+  // The project this form lives in: its own table's project, else the project
+  // selected in the top bar ("__none__" / none = unknown → no project filtering).
+  const current = getCurrentProjectId();
+  const projectId: string | null =
+    own?.project_id != null ? String(own.project_id)
+    : current && current !== '__none__' ? current
+    : null;
+
+  // Tables are stored as "<Name>__<projectId>" (e.g. Client__31), but a link field only
+  // stores the plain name ("Output"), so also match this project's suffixed table.
+  const suffixed = projectId != null ? `${lc}__${projectId}` : null;
+  const matches = list.filter(
+    s => s.table_name.toLowerCase() === lc ||
+         (suffixed != null && s.table_name.toLowerCase() === suffixed) ||
+         // "User31" is the project-31 table "User__31" with the underscores dropped
+         s.table_name.replace(/_/g, '').toLowerCase() === lc ||
+         (s.label ?? '').trim().toLowerCase() === lc,
+  );
+  const inScope = matches.filter(
+    s => !(projectId != null && s.project_id != null && !same(s.project_id, projectId)),
+  );
+
+  let chosen: string | null;
+  if (matches.length === 0) chosen = name;                 // not a registered name — use as given
+  else if (inScope.length === 0) chosen = null;            // only other projects have it
+  else {
+    const score = (s: BackendSchemaEntry) =>
+      (suffixed != null && s.table_name.toLowerCase() === suffixed ? 8 : 0) +
+      (same(s.project_id, projectId) ? 4 : 0) +
+      (own && same(s.module_id, own.module_id) ? 2 : 0) +
+      (s.table_name === name ? 1 : 0);
+    chosen = [...inScope].sort((a, b) => score(b) - score(a))[0].table_name;
+  }
+
+  // Shows which table a link field really reads (open the browser console to see it).
+  console.info(
+    `[form] link "${name}" on "${ownTable ?? '?'}" → ${chosen ? `table "${chosen}"` : 'no table in this project'}`,
+    { project: projectId, ownProject: own?.project_id, ownModule: own?.module_id,
+      candidates: matches.map(m => ({ table: m.table_name, label: m.label, project: m.project_id, module: m.module_id })) },
+  );
+  return chosen;
+}
+
+/** `ownTable` = the table the form belongs to; used to pick the same project/module's table. */
+function useLinkedOptions(tableName: string | null | undefined, ownTable?: string | number | null) {
   const [options,  setOptions]  = useState<{ value: string; label: string }[]>([]);
   const [loading,  setLoading]  = useState(false);
 
@@ -313,7 +451,8 @@ function useLinkedOptions(tableName: string | null | undefined) {
     if (!tableName) { setOptions([]); return; }
     let cancelled = false;
     setLoading(true);
-    fetchDomainRows(String(tableName))
+    resolveDomainTable(String(tableName), ownTable)
+      .then(resolved => (resolved ? fetchDomainRows(resolved) : []))
       .then(rows => {
         if (cancelled) return;
         setOptions(rows.map(r => ({ value: String(r.id ?? ''), label: rowLabel(r) })).filter(o => o.value));
@@ -322,7 +461,7 @@ function useLinkedOptions(tableName: string | null | undefined) {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tableName]);
+  }, [tableName, ownTable]);
 
   return { options, loading };
 }
@@ -340,7 +479,7 @@ export type RelatedStepInfo =
   // `many` = the field was marked cardinality "list": only then does the
   // step offer "+ Add" for several records; otherwise it is one normal form.
   | { kind: 'child'; domain: string; fkField: string; many?: boolean }
-  | { kind: 'list'; domain: string; fkField: string; junctionTable: string; many?: boolean };
+  | { kind: 'list'; domain: string; fkField: string; junctionTable: string; many?: boolean; label?: string; fromField?: boolean };
 
 // ─── Deep Nesting Types ──────────────────────────────────────────────────────
 
@@ -378,6 +517,8 @@ function useRelatedSteps(
           domain: related,
           fkField: parentIdField,
           junctionTable: `${parentDomain}_${related}`,
+          label: String((f as any).label || f.field_id),
+          fromField: true,
         };
       })
       .filter(s => !!s.domain);
@@ -445,6 +586,162 @@ function useRelatedSteps(
   return steps;
 }
 
+// Multi-select dropdown (checkbox list + chips). Value is a comma-joined string
+// of record ids so it fits the form's string-based state.
+function MultiSelectDropdown({
+  options, value, onChange, onBlur, placeholder, className, loading,
+}: {
+  options: { value: string; label: string }[];
+  value: string;
+  onChange: (v: string) => void;
+  onBlur: () => void;
+  placeholder: string;
+  className: string;
+  loading?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const boxRef = useRef<HTMLDivElement>(null);
+  const selected = useMemo(() => splitMulti(value), [value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        onBlur();
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const toggle = (id: string) => {
+    const next = selected.includes(id) ? selected.filter(x => x !== id) : [...selected, id];
+    onChange(next.join(','));
+  };
+  const labelOf = (id: string) => options.find(o => o.value === id)?.label ?? id;
+  const shown = options.filter(o => o.label.toLowerCase().includes(query.toLowerCase()));
+
+  return (
+    <div ref={boxRef} className="relative">
+      <div
+        role="button"
+        tabIndex={0}
+        className={`${className} min-h-[42px] flex flex-wrap items-center gap-1.5 cursor-pointer`}
+        onClick={() => setOpen(o => !o)}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(o => !o); } }}
+      >
+        {loading ? (
+          <span className="flex items-center gap-2 text-xs text-muted-foreground/60">
+            <Loader2 className="w-3 h-3 animate-spin" /> Loading…
+          </span>
+        ) : selected.length === 0 ? (
+          <span className="text-muted-foreground/50">{placeholder}</span>
+        ) : selected.map(id => (
+          <span key={id} className="inline-flex items-center gap-1 rounded-md bg-primary/15 text-primary text-xs px-2 py-0.5">
+            {labelOf(id)}
+            <button
+              type="button"
+              className="hover:text-destructive leading-none"
+              onClick={e => { e.stopPropagation(); toggle(id); }}
+              aria-label={`Remove ${labelOf(id)}`}
+            >×</button>
+          </span>
+        ))}
+        <span className="ml-auto text-muted-foreground/60 text-xs">▾</span>
+      </div>
+
+      {open && (
+        <div className="absolute z-50 mt-1 w-full rounded-xl border border-border bg-card shadow-lg">
+          <input
+            autoFocus
+            className="w-full bg-transparent border-b border-border px-3 py-2 text-sm outline-none"
+            placeholder="Search…"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+          />
+          <div className="max-h-56 overflow-y-auto py-1">
+            {shown.length === 0 && (
+              <div className="px-3 py-2 text-xs text-muted-foreground">No records found</div>
+            )}
+            {shown.map(o => (
+              <label key={o.value} className="flex items-center gap-2 px-3 py-2 text-sm cursor-pointer hover:bg-secondary/60">
+                <input
+                  type="checkbox"
+                  checked={selected.includes(o.value)}
+                  onChange={() => toggle(o.value)}
+                />
+                <span className="truncate">{o.label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Picker for an association (junction-table) relation: choose EXISTING records
+// of the related domain inline in the parent form. The chosen ids are written
+// to the junction table after the parent row is saved (see doSubmit).
+const PICKER_BASE = 'w-full rounded-xl border bg-card text-foreground text-sm px-3 py-2.5 outline-none transition-all border-border focus:border-primary/60 focus:ring-2 focus:ring-primary/15';
+
+function LinkedPicker({
+  step, value, onChange, ownTable, onAddNew, staged, onEditStaged, onClearStaged,
+}: {
+  step: RelatedStepInfo;
+  value: string;
+  onChange: (v: string) => void;
+  /** The form's own table — used to read the related table of the same project. */
+  ownTable?: string | number | null;
+  /** Opens the create page of the related domain (offered when it has no records). */
+  onAddNew?: (domain: string) => void;
+  staged?: { label: string } | null;
+  onEditStaged?: () => void;
+  onClearStaged?: () => void;
+}) {
+  const { options, loading } = useLinkedOptions(step.domain, ownTable);
+  const canAdd = !!onAddNew && options.length === 0;
+  // A record added on the create page, or an empty list that can be added to,
+  // is shown by LinkedSelect (for both single and multiple pickers).
+  if (staged || (canAdd && !loading)) {
+    return (
+      <LinkedSelect
+        domain={step.domain} options={options} value={value} onChange={onChange} onBlur={() => {}} className={PICKER_BASE}
+        onAddNew={onAddNew} staged={staged} onEditStaged={onEditStaged} onClearStaged={onClearStaged}
+      />
+    );
+  }
+  if (step.many) {
+    return (
+      <MultiSelectDropdown
+        options={options}
+        loading={loading}
+        value={value}
+        onChange={onChange}
+        onBlur={() => {}}
+        className={PICKER_BASE}
+        placeholder={`— select ${step.domain} (multiple) —`}
+      />
+    );
+  }
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 h-10 px-3 rounded-xl border border-border bg-card/50 text-muted-foreground/40 text-xs">
+        <Loader2 className="w-3 h-3 animate-spin" /> Loading <DomainLabel name={step.domain} />…
+      </div>
+    );
+  }
+  return (
+    <LinkedSelect
+      domain={step.domain} options={options} value={value} onChange={onChange} onBlur={() => {}} className={PICKER_BASE}
+      onAddNew={onAddNew}
+    />
+  );
+}
+
 // One <option> of a domain-choice dropdown: shows the domain's business label,
 // submits its table name.
 function DomainChoiceOption({ name }: { name: string }) {
@@ -452,12 +749,198 @@ function DomainChoiceOption({ name }: { name: string }) {
   return <option value={name}>{label}</option>;
 }
 
+// ─── "Add new" for an empty linked dropdown ──────────────────────────────────
+// When the linked domain (e.g. Output) has no records yet, the dropdown offers
+// "+ Add Output". It opens that domain's create page; the record is only held
+// in the form (STAGED_NEW stands in for its id) and is created together with
+// the parent row when the main form is submitted.
+const STAGED_NEW = '__new__';
+const ADD_NEW_OPTION = '__add_new__';
+
+type StagedRecord = {
+  domain: string;                       // name as stored on the link field
+  table: string;                        // resolved table it will be created in
+  values: Record<string, string>;
+  schema: BackendSchemaField[];         // fields that were shown, to type the values
+};
+
+function stagedToRow(st: StagedRecord): Record<string, any> {
+  const row: Record<string, any> = {};
+  for (const f of st.schema) {
+    const raw = st.values[f.field_id] ?? '';
+    if (raw === '') continue;
+    if (isMultiRefField(f))        { const ids = splitMulti(raw); if (ids.length) row[f.field_id] = ids; }
+    else if (f.type === 'number')  row[f.field_id] = Number(raw);
+    else if (f.type === 'boolean') row[f.field_id] = raw === 'true';
+    else                           row[f.field_id] = raw;
+  }
+  return row;
+}
+
+function LinkedSelect({
+  domain, options, value, onChange, onBlur, className,
+  onAddNew, staged, onEditStaged, onClearStaged,
+}: {
+  domain: string;
+  options: { value: string; label: string }[];
+  value: string;
+  onChange: (v: string) => void;
+  onBlur: () => void;
+  className: string;
+  onAddNew?: (domain: string) => void;
+  staged?: { label: string } | null;
+  onEditStaged?: () => void;
+  onClearStaged?: () => void;
+}) {
+  if (staged) {
+    return (
+      <div className="flex items-center gap-2 rounded-xl border border-primary/40 bg-primary/5 px-3 py-2.5 text-sm">
+        <span className="flex-1 min-w-0 truncate font-semibold text-foreground">{staged.label}</span>
+        <span className="shrink-0 text-[9px] font-black uppercase tracking-widest text-primary/70">New · saved with this form</span>
+        <button type="button" onClick={onEditStaged} className="shrink-0 text-xs font-bold text-primary hover:underline">Edit</button>
+        <button type="button" onClick={onClearStaged} className="shrink-0 text-xs font-bold text-destructive hover:underline">Remove</button>
+      </div>
+    );
+  }
+  // "+ Add <domain>" is always offered, not only when the list is empty
+  const canAdd = !!onAddNew;
+  return (
+    <select
+      className={className}
+      value={value}
+      onChange={e => {
+        if (e.target.value === ADD_NEW_OPTION) { onAddNew?.(domain); return; }
+        onChange(e.target.value);
+      }}
+      onBlur={onBlur}
+    >
+      <option value="">— select <DomainLabel name={domain} /> —</option>
+      {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      {options.length === 0 && !canAdd && (
+        <option disabled value="">No records in "<DomainLabel name={domain} />" — create one first</option>
+      )}
+      {canAdd && <option value={ADD_NEW_OPTION}>+ Add <DomainLabel name={domain} /></option>}
+    </select>
+  );
+}
+
+/** Full "Create <domain>" page opened from the "+ Add" option. */
+function StagedRecordPanel({
+  domain, parentDomain, initial, onSave, onCancel,
+}: {
+  domain: string;
+  parentDomain?: string | number | null;
+  initial?: Record<string, string>;
+  onSave: (rec: StagedRecord) => void;
+  onCancel: () => void;
+}) {
+  // undefined = still resolving, null = this project has no such domain model
+  const [table, setTable] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    let off = false;
+    resolveDomainTable(domain, parentDomain).then(t => { if (!off) setTable(t); });
+    return () => { off = true; };
+  }, [domain, parentDomain]);
+
+  const { schema: raw, loading } = useFormSchema(table ?? null);
+  const fields = useMemo(() => (raw ?? []).filter(f =>
+    f.field_id !== 'id' && f.field_id !== 'created_at' && f.field_id !== 'updated_at' &&
+    !f.field_id.endsWith('Id') &&
+    !VERSIONING_SYSTEM_FIELDS.has(f.field_id) &&
+    !['fromdate', 'validfrom', 'todate', 'isactive'].includes(f.field_id.toLowerCase().replace(/_/g, '')) &&
+    !isListRelationField(f)
+  ), [raw]);
+
+  const [values, setValues] = useState<Record<string, string>>(initial ?? {});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  function save() {
+    const errs: Record<string, string> = {};
+    for (const f of fields) {
+      const e = validateField(values[f.field_id] ?? '', f);
+      if (e) errs[f.field_id] = e;
+    }
+    setErrors(errs);
+    if (Object.keys(errs).length || !table) return;
+    onSave({ domain, table, values, schema: fields });
+  }
+
+  return (
+    <div className="h-full w-full flex flex-col bg-card rounded-2xl overflow-hidden">
+      <div className="flex items-center gap-3 px-5 py-3 border-b border-border bg-secondary/20 shrink-0">
+        <button type="button" onClick={onCancel} className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground hover:text-foreground">
+          <ArrowLeft className="w-3.5 h-3.5" /> Back
+        </button>
+        <span className="text-muted-foreground/30">·</span>
+        <h3 className="text-sm font-bold text-foreground">Create <DomainLabel name={domain} /></h3>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-4">
+        {table === null ? (
+          <div className="text-xs text-destructive">
+            There is no "<DomainLabel name={domain} />" domain model in this project, so a record can't be created here.
+          </div>
+        ) : table === undefined || loading ? (
+          <div className="flex items-center gap-2 text-muted-foreground/40 text-xs">
+            <Loader2 className="w-4 h-4 animate-spin" /> Loading <DomainLabel name={domain} /> fields…
+          </div>
+        ) : fields.length === 0 ? (
+          <div className="text-xs text-muted-foreground/40 italic">
+            "<DomainLabel name={domain} />" has no fields to fill in.
+          </div>
+        ) : fields.map(f => (
+          <div key={f.field_id} className="flex flex-col gap-1.5">
+            <label className="text-[10px] font-black uppercase tracking-widest text-muted-foreground/60">
+              {f.label || f.field_id}
+              {isRequired(f) && <span className="text-destructive ml-1">*</span>}
+            </label>
+            <FieldInput
+              field={f}
+              value={values[f.field_id] ?? ''}
+              hasError={!!errors[f.field_id]}
+              onChange={v => {
+                setValues(p => ({ ...p, [f.field_id]: v }));
+                setErrors(p => { if (!p[f.field_id]) return p; const n = { ...p }; delete n[f.field_id]; return n; });
+              }}
+              onBlur={() => {}}
+              ownTable={table}
+            />
+            {errors[f.field_id] && (
+              <p className="flex items-center gap-1 text-destructive text-[10px] font-semibold">
+                <AlertCircle className="w-3 h-3 flex-shrink-0" /> {errors[f.field_id]}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="px-5 py-3 border-t border-border shrink-0 flex items-center gap-3">
+        <p className="flex-1 text-[10px] text-muted-foreground/50">
+          Saved together with the main form when you submit it.
+        </p>
+        <button type="button" onClick={onCancel} className="px-4 py-2 rounded-xl border border-border text-xs font-bold text-muted-foreground hover:bg-secondary">
+          Cancel
+        </button>
+        <button type="button" onClick={save} className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-xs font-black hover:opacity-90">
+          <Plus className="w-3.5 h-3.5" /> Use this <DomainLabel name={domain} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Individual field input (handles every type) ──────────────────────────────
 
 function FieldInput({
   field, value, hasError, onChange, onBlur, disabled, ownTable,
+  onAddNew, staged, onEditStaged, onClearStaged,
 }: {
   ownTable?: string | number | null;
+  /** Opens the create page of the linked domain (offered when its dropdown is empty). */
+  onAddNew?: (domain: string) => void;
+  staged?: { label: string } | null;
+  onEditStaged?: () => void;
+  onClearStaged?: () => void;
   field: BackendSchemaField;
   value: string;
   hasError: boolean;
@@ -465,16 +948,18 @@ function FieldInput({
   onBlur: () => void;
   disabled?: boolean;
 }) {
-const { options, loading } = useLinkedOptions(isDatasourceField(field) ? field.datasource : null);
+const { options, loading } = useLinkedOptions(isDatasourceField(field) ? field.datasource : null, ownTable);
 
 // A field like "libraryId" inside the "Library" domain is that domain's OWN
 // identifier, not a reference to another table — render it as a normal input.
 const isOwnId = !!ownTable && field.field_id.endsWith('Id') &&
   field.field_id.slice(0, -2).toLowerCase() === String(ownTable).toLowerCase();
-const fkDomain = !isDatasourceField(field) && field.field_id.endsWith('Id') && !isOwnId
+const refDomain = isDomainRefField(field) ? getRefDomain(field) : null;
+const { options: refOptions, loading: refLoading } = useLinkedOptions(refDomain, ownTable);
+const fkDomain = !refDomain && !isDatasourceField(field) && field.field_id.endsWith('Id') && !isOwnId
   ? field.field_id.slice(0, -2)
   : null;
-const { options: fkOptions, loading: fkLoading } = useLinkedOptions(fkDomain);
+const { options: fkOptions, loading: fkLoading } = useLinkedOptions(fkDomain, ownTable);
 
 // ── Auto-filled fields — hide from UI, submit silently ──────────────────
 const AUTO_HIDDEN = ["fromdate", "validfrom", "todate", "isactive"];
@@ -502,6 +987,36 @@ if (AUTO_HIDDEN.some(h => field.field_id.toLowerCase().replace(/_/g, '') === h))
     );
   }
 
+  // domain_model field → pick record(s) from the linked domain
+  if (refDomain) {
+    if (isMultiRefField(field)) {
+      return (
+        <MultiSelectDropdown
+          options={refOptions}
+          loading={refLoading}
+          value={value}
+          onChange={onChange}
+          onBlur={onBlur}
+          className={base}
+          placeholder={`— select ${field.label || field.field_id} (multiple) —`}
+        />
+      );
+    }
+    if (refLoading) {
+      return (
+        <div className="flex items-center gap-2 h-10 px-3 rounded-xl border border-border bg-card/50 text-muted-foreground/40 text-xs">
+          <Loader2 className="w-3 h-3 animate-spin" /> Loading <DomainLabel name={refDomain} />…
+        </div>
+      );
+    }
+    return (
+      <LinkedSelect
+        domain={refDomain} options={refOptions} value={value} onChange={onChange} onBlur={onBlur} className={base}
+        onAddNew={disabled ? undefined : onAddNew} staged={staged} onEditStaged={onEditStaged} onClearStaged={onClearStaged}
+      />
+    );
+  }
+
   // Linked field — select from another table
 // Auto-detect FK fields by name ending in "Id" (e.g. clinicId → clinic)
   if (fkDomain) {
@@ -513,13 +1028,10 @@ if (AUTO_HIDDEN.some(h => field.field_id.toLowerCase().replace(/_/g, '') === h))
       );
     }
     return (
-      <select className={base} value={value} onChange={e => onChange(e.target.value)} onBlur={onBlur}>
-        <option value="">— select <DomainLabel name={fkDomain} /> —</option>
-        {fkOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        {fkOptions.length === 0 && (
-          <option disabled value="">No records in "<DomainLabel name={fkDomain} />" — create one first</option>
-        )}
-      </select>
+      <LinkedSelect
+        domain={fkDomain} options={fkOptions} value={value} onChange={onChange} onBlur={onBlur} className={base}
+        onAddNew={disabled ? undefined : onAddNew} staged={staged} onEditStaged={onEditStaged} onClearStaged={onClearStaged}
+      />
     );
   }
 
@@ -730,7 +1242,8 @@ export function RepeatableRelatedStepForm({
         for (const f of editableSchema) {
           const raw = item[f.field_id] ?? '';
           if (raw === '') continue;
-          if (f.type === 'number')       row[f.field_id] = Number(raw);
+          if (isMultiRefField(f))        row[f.field_id] = splitMulti(raw);
+          else if (f.type === 'number')  row[f.field_id] = Number(raw);
           else if (f.type === 'boolean') row[f.field_id] = raw === 'true';
           else                           row[f.field_id] = raw;
         }
@@ -934,14 +1447,41 @@ const schema = useMemo(() => {
   // others are alternatives, not extra steps. Domains outside any choice group
   // (ordinary child / list relations) are always kept.
   const choiceFields = useMemo(() => (rawSchema ?? []).filter(isDomainChoiceField), [rawSchema]);
+  // Association (junction) links to ONE domain are picked inline from existing
+  // records. Domain-choice groups and child (FK) relations stay wizard steps.
+  const isPickerStep = useCallback((step: RelatedStepInfo) => {
+    if (step.kind !== 'list') return false;
+    return !choiceFields.some(cf => getChoiceDomains(cf).some(d => d.toLowerCase() === String(step.domain).toLowerCase()));
+  }, [choiceFields]);
+  // A junction-derived picker is redundant when this table already has an
+  // inline field for the same domain (a dropdown or an "…Id" column).
+  const coveredDomains = useMemo(() => {
+    const set = new Set<string>();
+    for (const f of rawSchema ?? []) {
+      const ref = getRefDomain(f);
+      if (ref) set.add(ref.toLowerCase());
+      const id = String(f.field_id ?? '');
+      const rd = getRelatedDomainName(f);
+      if (id.endsWith('Id') && id.length > 2 && (rd || (f as any).relationKind === 'association')) {
+        set.add(String(rd ?? id.slice(0, -2)).toLowerCase());
+      }
+    }
+    return set;
+  }, [rawSchema]);
+  const pickerSteps = useMemo(
+    () => allRelatedSteps.filter(st => isPickerStep(st) && (('fromField' in st && st.fromField) || !coveredDomains.has(String(st.domain).toLowerCase()))),
+    [allRelatedSteps, isPickerStep, coveredDomains],
+  );
+  const linkKey = (step: RelatedStepInfo) => `__link:${step.domain}`;
   const stepsForValues = useCallback((vals: Record<string, string>): RelatedStepInfo[] => {
-    if (choiceFields.length === 0) return allRelatedSteps;
+    const wizardOnly = allRelatedSteps.filter(st => !isPickerStep(st));
+    if (choiceFields.length === 0) return wizardOnly;
     const eq = (a: unknown, b: unknown) => String(a).toLowerCase() === String(b).toLowerCase();
-    return allRelatedSteps.filter(step => choiceFields.every(cf => {
+    return wizardOnly.filter(step => choiceFields.every(cf => {
       if (!getChoiceDomains(cf).some(d => eq(d, step.domain))) return true;
       return eq(vals[cf.field_id] ?? '', step.domain);
     }));
-  }, [allRelatedSteps, choiceFields]);
+  }, [allRelatedSteps, choiceFields, isPickerStep]);
   const relatedSteps = useMemo(() => stepsForValues(values), [stepsForValues, values]);
   const hasChildren  = relatedSteps.length > 0;
 
@@ -962,6 +1502,11 @@ const schema = useMemo(() => {
   // ── Multi-step child form ──────────────────────────────────────────────────
   const [childSteps,     setChildSteps]     = useState<Array<RelatedStepInfo & { presetValues: Record<string, string> }>>([]);
   const [currentStep,    setCurrentStep]    = useState(0);
+  // New linked records (e.g. an Output) entered on their own create page; they
+  // are created together with this form's row on submit.
+  const [staged,   setStaged]   = useState<Record<string, StagedRecord>>({});
+  const [addingFor, setAddingFor] = useState<{ fieldId: string; domain: string } | null>(null);
+  const stagedCreatedRef = useRef<Record<string, string>>({});   // fieldId → id already created (reused on retry)
   const [parentRecordId, setParentRecordId] = useState<string | undefined>();
   // Stable refs
   const schemaRef  = useRef<BackendSchemaField[] | null>(null);
@@ -1138,10 +1683,32 @@ async function doSubmit() {
     setSubmitState('loading');
 
     try {
+      // Create the new linked records first, so their ids can go on this row.
+      const vals: Record<string, string> = { ...values };
+      for (const [fieldId, st] of Object.entries(staged)) {
+        if (vals[fieldId] !== STAGED_NEW) continue;
+        if (!stagedCreatedRef.current[fieldId]) {
+          await setDatastoreBackend(dbBackend);
+          const created = await submitFormRow(st.table, stagedToRow(st));
+          if (created.status !== 'success' || !created.record_id) {
+            const detail = created.errors ? Object.values(created.errors).join('; ') : created.message;
+            throw new Error(`Could not create ${st.domain}: ${detail ?? 'submission failed'}`);
+          }
+          stagedCreatedRef.current[fieldId] = String(created.record_id);
+        }
+        vals[fieldId] = stagedCreatedRef.current[fieldId];
+      }
+
       const row: Record<string, any> = {};
       for (const f of schema) {
-        const raw = values[f.field_id] ?? '';
+        const raw = vals[f.field_id] ?? '';
         if (raw === '') continue;
+        if (isMultiRefField(f)) {
+          const ids = splitMulti(raw);
+          if (ids.length === 0) continue;
+          row[f.field_id] = ids;
+          continue;
+        }
         if (isMultiValueField(f)) {
           const parts = splitMulti(raw);
           if (parts.length === 0) continue;
@@ -1192,6 +1759,36 @@ let res = await submitFormRow(String(dataSourceId), row);
 
       if (res.status !== 'success') throw new Error(res.message ?? 'Submission failed');
 
+      // ── Link the records picked in the inline association pickers ─────────
+      if (res.record_id) {
+        for (const step of pickerSteps) {
+          if (step.kind !== 'list') continue;
+          const ids = splitMulti(valuesRef.current[linkKey(step)] ?? '')
+            .map(id => (id === STAGED_NEW ? stagedCreatedRef.current[linkKey(step)] : id))
+            .filter(Boolean);
+          for (const id of ids) {
+            const link = { [step.fkField]: res.record_id, [`${step.domain}Id`]: id };
+            try {
+              await submitFormRow(step.junctionTable, link);
+            } catch {
+              try {
+                await createDomain({
+                  table_name: step.junctionTable,
+                  schema: [
+                    { field_id: step.fkField,           type: 'text', label: step.fkField,           value: null },
+                    { field_id: `${step.domain}Id`,     type: 'text', label: `${step.domain}Id`,     value: null },
+                  ],
+                  db_backend: dbBackend,
+                });
+                await submitFormRow(step.junctionTable, link);
+              } catch (e2) {
+                console.warn(`Junction insert failed for "${step.junctionTable}":`, e2);
+              }
+            }
+          }
+        }
+      }
+
       const dbLabel = dbBackend === 'postgresql' ? 'PostgreSQL' : 'DynamoDB';
       successMsg = successMsg || `Saved to ${dbLabel}! Record ID: ${res.record_id ?? '—'}`;
 
@@ -1239,6 +1836,8 @@ let res = await submitFormRow(String(dataSourceId), row);
       });
       setErrors({});
       setTouched({});
+      setStaged({});
+      stagedCreatedRef.current = {};
 
       setRolesLoading(true);
       fetchRolesForDomain(String(dataSourceId))
@@ -1291,6 +1890,27 @@ let res = await submitFormRow(String(dataSourceId), row);
   const DB_COLOR = dbBackend === 'postgresql'
     ? 'bg-blue-500/10 border-blue-500/20 text-blue-600/80'
     : 'bg-orange-500/10 border-orange-500/20 text-orange-600/80';
+
+// ── "+ Add <linked domain>" create page ───────────────────────────────────────
+  if (addingFor && !showDetails) {
+    return (
+      <StagedRecordPanel
+        key={addingFor.fieldId}
+        domain={addingFor.domain}
+        parentDomain={dataSourceId}
+        initial={staged[addingFor.fieldId]?.values}
+        onCancel={() => setAddingFor(null)}
+        onSave={rec => {
+          const fid = addingFor.fieldId;
+          delete stagedCreatedRef.current[fid];
+          setStaged(p => ({ ...p, [fid]: rec }));
+          setValues(prev => { const next = { ...prev, [fid]: STAGED_NEW }; valuesRef.current = next; return next; });
+          setErrors(prev => { if (!prev[fid]) return prev; const n = { ...prev }; delete n[fid]; return n; });
+          setAddingFor(null);
+        }}
+      />
+    );
+  }
 
 // ── Child / list-relation step wizard ────────────────────────────────────────
   if (currentStep > 0 && childSteps.length > 0 && !showDetails) {
@@ -1451,6 +2071,7 @@ let res = await submitFormRow(String(dataSourceId), row);
                 const raw = values[field.field_id] ?? '';
                 const displayVal = raw === ''
                   ? <span className="italic text-muted-foreground/30">—</span>
+                  : raw === STAGED_NEW && staged[field.field_id] ? `${rowLabel(staged[field.field_id].values)} (new)`
                   : raw === 'true' ? 'Yes'
                   : raw === 'false' ? 'No'
                   : raw;
@@ -1694,6 +2315,14 @@ let res = await submitFormRow(String(dataSourceId), row);
                         onBlur={() => handleBlur(field)}
                         ownTable={dataSourceId}
                         disabled={lockedFields?.includes(field.field_id)}
+                        onAddNew={d => setAddingFor({ fieldId: field.field_id, domain: d })}
+                        staged={staged[field.field_id] ? { label: rowLabel(staged[field.field_id].values) } : null}
+                        onEditStaged={() => setAddingFor({ fieldId: field.field_id, domain: staged[field.field_id].domain })}
+                        onClearStaged={() => {
+                          setStaged(p => { const n = { ...p }; delete n[field.field_id]; return n; });
+                          delete stagedCreatedRef.current[field.field_id];
+                          handleChange(field.field_id, '');
+                        }}
                       />
 
                       {/* Inline error message */}
@@ -1705,11 +2334,32 @@ let res = await submitFormRow(String(dataSourceId), row);
                     </div>
                   );
                 })}
+
+                {/* Association links — pick existing records of the related domain */}
+                {pickerSteps.map(step => (
+                  <div key={linkKey(step)} data-field-id={linkKey(step)} className="flex flex-col gap-1.5 rounded-xl">
+                    <label className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      {step.kind === 'list' && step.label ? step.label : <DomainLabel name={step.domain} />}
+                    </label>
+                    <LinkedPicker
+                      step={step}
+                      value={values[linkKey(step)] ?? ''}
+                      onChange={v => setValues(prev => ({ ...prev, [linkKey(step)]: v }))}
+                      ownTable={dataSourceId}
+                      onAddNew={d => setAddingFor({ fieldId: linkKey(step), domain: d })}
+                      staged={staged[linkKey(step)] ? { label: rowLabel(staged[linkKey(step)].values) } : null}
+                      onEditStaged={() => setAddingFor({ fieldId: linkKey(step), domain: staged[linkKey(step)].domain })}
+                      onClearStaged={() => {
+                        const k = linkKey(step);
+                        setStaged(p => { const n = { ...p }; delete n[k]; return n; });
+                        delete stagedCreatedRef.current[k];
+                        setValues(prev => ({ ...prev, [k]: '' }));
+                      }}
+                    />
+                  </div>
+                ))}
               </div>
 
-              {dataSourceId && !can(String(dataSourceId), 'create') ? (
-                <p className="text-xs text-muted-foreground">You don't have permission to create {String(dataSourceId)} records.</p>
-              ) : (
               <button
                 type="submit"
                 disabled={submitState === 'loading'}
@@ -1731,7 +2381,6 @@ let res = await submitFormRow(String(dataSourceId), row);
                   <><Send className="w-3.5 h-3.5" /> {configs.submitLabel || 'Submit'}</>
                 )}
               </button>
-              )}
 
             </form>
           </div>
