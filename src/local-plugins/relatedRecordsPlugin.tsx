@@ -16,14 +16,14 @@
  *    Existing" picker, also exported individually in case something needs
  *    to render just one relation without the group wrapper.
  */
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { ArrowLeft, Loader2, Plus, Link2, Link2Off, Search, Pencil, Trash2 } from "lucide-react";
 import { type ViewBuilderPlugin } from "../sky-view-builder/core/plugin";
 import {
   fetchDomainRows, fetchDomainSchema, fetchAllSchemas, updateDomainRow,
   submitFormRow, deleteDomainRow, getActiveProject,
 } from "../api/datastoreApi";
-import { RepeatableRelatedStepForm, type RelatedStepInfo } from "./formplugin";
+import { FormComponent } from "./formplugin";
 import { DataTable } from "./DataTable";
 import { withDbMultiLang } from '../sky-view-builder/components/withDbMultiLang';
 import { withVisualStyle, StyledSurface } from '../sky-view-builder/styles/withVisualStyle';
@@ -34,6 +34,11 @@ import {
   stripServerOwnedFields, actualRowId, capitalize, rowLabel, shouldSkip, isRelationField,
   useThemeColors, Loading, Empty,
 } from "./domainListShared";
+
+const CREATE_FORM_CONFIGS = {
+  formTitle: "", submitLabel: "Save", columnLayout: "1" as const, successMessage: "",
+  showFieldTypes: false, enableReview: false, reviewTitle: "", confirmLabel: "Confirm", redirectUrl: "",
+};
 
 // ─── Hook: detect relations for a domain/record ────────────────────────────
 // Moved verbatim out of DetailView's useEffect — same detection logic, now
@@ -651,26 +656,10 @@ export function RelatedTab({
         fetchDomainSchema(relation.domain).catch(() => ({ schema: [], db_backend: "postgresql" as const })),
       ])
         .then(([domainRows, schemaRes]) => {
-          const matched = domainRows.filter(r => String(r[relation.fkField]) === parentId);
-          // Debug aid: why a related tab is empty (wrong table, wrong FK column, wrong parent id).
-          console.info('[related-rows]', {
-            relatedDomain: relation.domain,
-            resolvedTable: (schemaRes as any).table_name ?? relation.domain,
-            activeProject: getActiveProject(),
-            fkField: relation.fkField,
-            parentId,
-            rowsReturned: domainRows.length,
-            rowsMatchingParent: matched.length,
-            sampleFkValues: domainRows.slice(0, 5).map(r => r[relation.fkField]),
-            firstRowKeys: domainRows[0] ? Object.keys(domainRows[0]) : [],
-          });
-          setStoreRows(cacheKey, matched);
+          setStoreRows(cacheKey, domainRows.filter(r => String(r[relation.fkField]) === parentId));
           setStoreSchema(cacheKey, schemaRes.schema ?? []);
         })
-        .catch((e) => {
-          console.error('[related-rows] failed to load', relation.domain, '->', e?.message ?? e);
-          setStoreRows(cacheKey, []);
-        })
+        .catch(() => setStoreRows(cacheKey, []))
         .finally(() => setStoreLoading(cacheKey, false));
     } else if (relation.mode === "list") {
       loadListRelation();
@@ -746,6 +735,42 @@ export function RelatedTab({
   const cols = schema.filter(f => !shouldSkip(f.field_id) && !isRelationField(f)).map(f => f.field_id).slice(0, 6);
   const { headerBg, buttonBg, buttonFg } = useThemeColors();
  
+  // ── Inline "Create" uses the domain's normal form (same as the main list) ──
+  const createPreset = useMemo<Record<string, string>>(
+    () => (relation.mode === "fk_children" && relation.fkField && parentId
+      ? { [relation.fkField]: String(parentId) } : {}),
+    [relation.mode, relation.fkField, parentId],
+  );
+  const createLocked = useMemo<string[]>(
+    () => (relation.mode === "fk_children" && relation.fkField ? [relation.fkField] : []),
+    [relation.mode, relation.fkField],
+  );
+  const createExclude = useCallback(
+    (f: { field_id: string }) => f.field_id === relation.fkField && relation.mode === "list",
+    [relation.fkField, relation.mode],
+  );
+  async function linkCreated(recordId: string) {
+    // many-to-many: link the new row to the parent through the junction table.
+    // Use the junction's real columns (fkField = parent side, viaField = related
+    // side), not `${parentDomain}Id` — tables are stored per project ("Client__31")
+    // while junction columns carry the plain name ("ClientId").
+    if (relation.mode !== "list") return;
+    if (!relation.junctionTable || !parentId) {
+      console.warn("[related create] cannot link — missing junction/parent", { relation, parentId });
+      return;
+    }
+    const link = {
+      [relation.fkField]: parentId,
+      [relation.viaField ?? `${relation.domain}Id`]: recordId,
+    };
+    try {
+      const res = await submitFormRow(relation.junctionTable, link);
+      if (res.status !== "success") console.warn("[related create] junction insert failed", relation.junctionTable, link, res);
+    } catch (e) {
+      console.warn("[related create] junction insert threw", relation.junctionTable, link, e);
+    }
+  }
+
   if (loading) return <Loading text={`Loading ${relation.domain}…`} />;
  
   // Both one-to-many (fk_children) and many-to-many (list) support an
@@ -768,7 +793,7 @@ export function RelatedTab({
     return (
       <div className="flex flex-col h-full">
         <div className="flex items-center gap-3 px-1 pb-3 mb-1 border-b border-border">
-          <button onClick={() => setShowCreate(false)}
+          <button onClick={() => { setShowCreate(false); reload(); }}
             className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
             <ArrowLeft className="w-3.5 h-3.5" /> Cancel
           </button>
@@ -777,17 +802,18 @@ export function RelatedTab({
             Create {relation.domain}
           </span>
         </div>
-        <RepeatableRelatedStepForm
-          step={
-            relation.mode === "list"
-              ? { kind: "list", many: true, domain: relation.domain, fkField: relation.fkField, junctionTable: relation.junctionTable! } as RelatedStepInfo
-              : { kind: "child", many: true, domain: relation.domain, fkField: relation.fkField } as RelatedStepInfo
-          }
-          parentDomain={parentDomain}
-          parentId={parentId}
-          isLastStep={true}
-          onContinue={() => { setShowCreate(false); reload(); }}
-        />
+        <div className="flex-1 overflow-y-auto">
+          <FormComponent
+            configs={CREATE_FORM_CONFIGS}
+            dataSourceId={relation.domain}
+            isPreview={false}
+            presetValues={createPreset}
+            lockedFields={createLocked}
+            excludeFields={createExclude}
+            onCreated={linkCreated}
+            onSuccess={() => { setShowCreate(false); reload(); }}
+          />
+        </div>
       </div>
     );
   }
@@ -865,7 +891,8 @@ return (
         </div>
       )}
       <DataTable
-        columns={cols.map(k => ({ key: k }))}
+        columns={cols.map(k => ({ key: k, label: schema.find(f => f.field_id === k)?.label || k }))}
+        preserveHeaderCase
         rows={rows}
         onRowClick={onOpenRecord ? (row) => onOpenRecord(relation.domain, row) : undefined}
         indexLabel="#"

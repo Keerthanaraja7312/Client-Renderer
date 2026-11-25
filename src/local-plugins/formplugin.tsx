@@ -1257,7 +1257,7 @@ export function RepeatableRelatedStepForm({
             const res = await submitFormRow(domain, row);
             if (res.status === 'success' && res.record_id) {
               const link = {
-                [`${parentDomain}Id`]: parentId,
+                [step.fkField]: parentId,
                 [`${domain}Id`]: res.record_id,
               };
               try {
@@ -1411,6 +1411,7 @@ export function FormComponent({
   dataSourceId,
   isPreview,
   onSuccess,
+  onCreated,
   excludeFields,
   presetValues,
   lockedFields,
@@ -1418,7 +1419,9 @@ export function FormComponent({
   configs: FormConfigs;
   dataSourceId?: string | number | null;
   isPreview?: boolean;
-  onSuccess?: () => void;
+  onSuccess?: (recordId?: string) => void | Promise<void>;
+  /** Fires right after the row is inserted, on EVERY path (even when a related-steps wizard follows). */
+  onCreated?: (recordId: string) => void | Promise<void>;
   excludeFields?: (field: { field_id: string }) => boolean;
   presetValues?: Record<string, string>;
   lockedFields?: string[];
@@ -1759,6 +1762,8 @@ let res = await submitFormRow(String(dataSourceId), row);
 
       if (res.status !== 'success') throw new Error(res.message ?? 'Submission failed');
 
+      if (res.record_id) await onCreated?.(String(res.record_id));
+
       // ── Link the records picked in the inline association pickers ─────────
       if (res.record_id) {
         for (const step of pickerSteps) {
@@ -1827,7 +1832,7 @@ let res = await submitFormRow(String(dataSourceId), row);
       setSubmitState('success');
       setSubmitMsg(successMsg || 'Done!');
 
-      onSuccess?.();
+      onSuccess?.(res.record_id ? String(res.record_id) : undefined);
 
       setValues(() => {
         const defaults: Record<string, string> = {};
