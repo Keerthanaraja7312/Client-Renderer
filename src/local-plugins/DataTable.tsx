@@ -36,6 +36,8 @@ export interface DataTableProps {
   muted?: boolean;
   variant?: 'default' | 'amber';
   headerBg?: string;
+  /** Show column headers exactly as written (no forced UPPERCASE). Default: false (uppercase). */
+  preserveHeaderCase?: boolean;
 }
 
 function defaultFmt(val: any): string {
@@ -112,6 +114,7 @@ export function DataTable({
   muted = false,
   variant = 'default',
   headerBg,
+  preserveHeaderCase = false,
 }: DataTableProps) {
   if (loading) return <Loading text={loadingText} />;
 
@@ -128,9 +131,10 @@ export function DataTable({
 
   const isAmber = variant === 'amber';
   const headerCls = isAmber ? 'border-b border-amber-500/20 bg-amber-500/5' : 'border-b border-border bg-secondary/20';
-  const thCls = isAmber
-    ? 'px-4 py-2.5 text-left text-[9px] font-black uppercase tracking-widest text-amber-600/50'
-    : 'px-4 py-2.5 text-left text-[9px] font-black uppercase tracking-widest text-muted-foreground/50';
+  const thColor = isAmber ? 'text-amber-600/50' : 'text-muted-foreground/50';
+  const thCls = preserveHeaderCase
+    ? `px-4 py-2.5 text-left text-[11px] font-semibold normal-case tracking-normal ${thColor}`
+    : `px-4 py-2.5 text-left text-[9px] font-black uppercase tracking-widest ${thColor}`;
   const rowHoverCls = isAmber ? 'hover:bg-amber-500/5' : 'hover:bg-secondary/10';
   const dividerCls = isAmber ? 'divide-amber-500/10' : 'divide-border/30';
   const borderCls = isAmber ? 'border-amber-500/20' : 'border-border';

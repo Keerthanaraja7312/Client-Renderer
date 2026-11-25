@@ -1048,6 +1048,7 @@ if (selected) {
             rows={effectiveRows}
             onRowClick={(row) => { if (!isQuerySource) setSelected(row); }}
             headerBg={headerBg}
+            preserveHeaderCase
             actions={isReadOnlySource ? [] : [
               ...(can(domainName, "edit") ? [{ icon: <Pencil className="w-3.5 h-3.5" />, title: "Edit", onClick: (row: Record<string, any>) => setEditRow(row) }] : []),
               ...(can(domainName, "delete") ? [{ icon: <Trash2 className="w-3.5 h-3.5" />, title: "Delete", onClick: (row: Record<string, any>) => setDeleteRow(row), className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors" }] : []),
