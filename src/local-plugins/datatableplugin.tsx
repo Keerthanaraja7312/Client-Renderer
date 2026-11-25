@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Table2, Loader2, AlertTriangle } from 'lucide-react';
 import {
   Table,
@@ -10,6 +10,8 @@ import {
 } from '@/components/ui/table';
 import { useComponentState } from '@/sky-view-builder/hooks/useComponentState';
 import { useQueriedDomainData } from '@/data/DataProvider';
+import { fetchDomainSchema } from '@/api/datastoreApi';
+import { useFieldTranslations } from '@/sky-view-builder/hooks/useFieldTranslations';
 import type { ViewBuilderPlugin } from '@/sky-view-builder/core/plugin';
 import { useStateFilteredRows } from '@/store/useStateFilteredRows';
 import type { StateFilter } from '@/store/stateFilters';
@@ -76,6 +78,30 @@ function DataTableCanvas({
     return Object.keys(remoteRows[0]).filter((k) => !k.startsWith('_'));
   }, [remoteRows]);
 
+  // ── Column headings = the label set on each attribute in the Domain Model.
+  // Falls back to the raw key for sources with no schema (e.g. Query / State).
+  const domainName = dataSourceId != null ? String(dataSourceId).trim() : '';
+  const sourceKind = dataSourceType ?? type ?? 'table';
+  const [schemaLabels, setSchemaLabels] = useState<Record<string, string>>({});
+  const { translateLabel } = useFieldTranslations(sourceKind === 'table' ? domainName : null);
+
+  useEffect(() => {
+    if (!domainName || sourceKind !== 'table') { setSchemaLabels({}); return; }
+    let cancelled = false;
+    fetchDomainSchema(domainName)
+      .then((res) => {
+        if (cancelled) return;
+        const map: Record<string, string> = {};
+        (res.schema ?? []).forEach((f: any) => { if (f.label) map[f.field_id] = f.label; });
+        setSchemaLabels(map);
+      })
+      .catch(() => { if (!cancelled) setSchemaLabels({}); });
+    return () => { cancelled = true; };
+  }, [domainName, sourceKind]);
+
+  const columnLabel = (key: string) =>
+    sourceKind === 'table' ? translateLabel(key, schemaLabels[key] ?? key) : key;
+
   const compact = configs.compact ?? false;
   const showHeader = configs.showHeader ?? true;
   const stripedRows = configs.stripedRows ?? false;
@@ -129,7 +155,7 @@ function DataTableCanvas({
                   <TableRow>
                     {showRowNumber && <TableHead>#</TableHead>}
                     {remoteColumns.map((col) => (
-                      <TableHead key={col}>{col}</TableHead>
+                      <TableHead key={col}>{columnLabel(col)}</TableHead>
                     ))}
                   </TableRow>
                 </TableHeader>

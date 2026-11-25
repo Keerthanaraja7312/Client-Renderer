@@ -1044,7 +1044,7 @@ if (selected) {
           <Empty text={isStateSource ? "No records in the bound state yet" : isQuerySource ? "This query returned no records" : `No records in "${domainName}" yet`} />
         ) : (
          <DataTable
-            columns={listCols.map(k => ({ key: k, label: translateLabel(k, k) }))}
+            columns={listCols.map(k => ({ key: k, label: translateLabel(k, schema.find(f => f.field_id === k)?.label || k) }))}
             rows={effectiveRows}
             onRowClick={(row) => { if (!isQuerySource) setSelected(row); }}
             headerBg={headerBg}
