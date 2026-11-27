@@ -25,6 +25,7 @@ import {
 } from "../api/datastoreApi";
 import { FormComponent } from "./formplugin";
 import { DataTable } from "./DataTable";
+import { DomainTabsCanvas, type TabOrientation, type TabStylingConfig } from "./domainTabsPlugin";
 import { withDbMultiLang } from '../sky-view-builder/components/withDbMultiLang';
 import { withVisualStyle, StyledSurface } from '../sky-view-builder/styles/withVisualStyle';
 import domainListMultiLang from './domain-list.multilang.json';
@@ -32,7 +33,7 @@ import { useDomainDataStore, useDomainRows, useDomainSchema } from "../sky-view-
 import {
   type SchemaField, type RelationInfo,
   stripServerOwnedFields, actualRowId, capitalize, rowLabel, shouldSkip, isRelationField,
-  useThemeColors, Loading, Empty,
+  useThemeColors, Loading, Empty, useDomainIdAttrs,
 } from "./domainListShared";
 
 const CREATE_FORM_CONFIGS = {
@@ -72,6 +73,245 @@ export function isJunctionLike(fields: SchemaField[]): boolean {
   return real.every(f => f.field_id.endsWith("Id"));
 }
 
+/** Related domains of `domainName`, resolved against the project-scoped schemas
+ *  (Client__11 …). `record` null = design time: reference fields are listed even
+ *  though there is no record whose value could be checked. Shared by the detail
+ *  view (useRelations) and the Configuration panel. */
+export function computeRelations(
+  schemas: any[],
+  domainName: string,
+  record: Record<string, any> | null,
+): RelationInfo[] {
+    const found: RelationInfo[] = [];
+    const domainNames = new Set(schemas.map(s => s.table_name));
+
+    // This domain's own fields — read up front so a relation can pick up
+    // its Owns / Uses label from a marker field declared on this domain.
+    const thisSchema = schemas.find(s => s.table_name === domainName);
+    const thisFields: SchemaField[] = thisSchema
+      ? (Array.isArray(thisSchema.schema)
+          ? thisSchema.schema
+          : Object.values(thisSchema.schema ?? {}))
+      : [];
+
+    // Tables are stored per project as "<Name>__<projectId>" (Client__31) while
+    // link fields and junction columns only carry the plain name ("Output",
+    // "User31"). Resolve plain names against THIS record's project so a
+    // same-named table of another project (e.g. project 30's "Output") is
+    // never used, and a table with no unsuffixed twin is still found.
+    const projectId = thisSchema?.project_id != null ? String(thisSchema.project_id) : null;
+    const inScope = (e: { project_id?: string | null }) =>
+      projectId == null || e.project_id == null || String(e.project_id) === projectId;
+    const baseOf = (e: any) => String(e.domain_name || e.table_name);
+    const myTable = domainName.toLowerCase();
+    const myBase  = (thisSchema ? baseOf(thisSchema) : domainName).toLowerCase();
+    /** Is `fieldId` the FK column that points at THIS domain (as declared by `entry`)? */
+    const pointsAtMe = (fieldId: string, entry: { project_id?: string | null }) => {
+      const f = fieldId.toLowerCase();
+      return f === `${myTable}id` || (inScope(entry) && f === `${myBase}id`);
+    };
+    /** A plain domain name → true when this project has a table for it. */
+    const resolves = (name: string) => {
+      const n = name.toLowerCase();
+      return schemas.some(s2 => inScope(s2) && (
+        s2.table_name.toLowerCase() === n ||
+        s2.table_name.replace(/_/g, "").toLowerCase() === n ||
+        baseOf(s2).toLowerCase() === n));
+    };
+
+    for (const entry of schemas) {
+      if (entry.table_name === domainName) continue;
+      const fields: SchemaField[] = Array.isArray(entry.schema)
+        ? entry.schema
+        : Object.values(entry.schema ?? {});
+
+      if (isJunctionLike(fields)) {
+        // Many-to-many — Schema Inspector never puts anything on the
+        // parent domain's OWN schema for this (no marker field, no
+        // "list"-type column at all — confirmed straight from its
+        // CreateDomainTab.buildPayloadFor: "purely creates the
+        // junction table, nothing added to THIS domain's field
+        // list"). So the only place this relationship is recorded is
+        // the junction table's own two FK columns — resolve directly
+        // from those instead of looking for something on `domainName`
+        // that will never exist.
+        //
+        // Only shown on the side that actually declared it, not both
+        // directions symmetrically — Schema Inspector always writes
+        // ${owningDomain}Id first and ${relatedDomain}Id second (e.g.
+        // building entity→grade from inside "entity" produces
+        // [entityId, gradeId] in exactly that order), so the first
+        // Id field in the junction is the owning side. If it doesn't
+        // match domainName, this domain is the TARGET of someone
+        // else's relation, not the owner — skip it, same as an
+        // fk_ref column only ever producing a tab on the domain that
+        // actually holds it, never a symmetric one on the far side.
+        const idFields = fields.filter(f => f.field_id.endsWith("Id"));
+        if (idFields.length < 2) continue;
+        if (!pointsAtMe(idFields[0].field_id, entry)) {
+          // This domain is the TARGET side of the link (e.g. College in
+          // University_College). It still gets a tab, but a read-only
+          // one: only the records assigned to this record, with just
+          // Edit / Delete — linking is managed from the owning side.
+          if (pointsAtMe(idFields[1].field_id, entry)) {
+            // The junction's owning side is marked "owns" (e.g. Client owns Output):
+            // the owned record doesn't list its owner back, so no tab here.
+            if (toLinkMode(idFields[0].linkMode) === "owns") continue;
+            const ownerDomain = idFields[0].field_id.slice(0, -2);
+            if (resolves(ownerDomain) && !found.some(r => r.domain === ownerDomain)) {
+              found.push({
+                domain:        ownerDomain,
+                mode:          "list",
+                fkField:       idFields[1].field_id,
+                junctionTable: entry.table_name,
+                viaField:      idFields[0].field_id,
+                label:         ownerDomain,
+                relationKind:  "association",
+                reverse:       true,
+              });
+            }
+          }
+          continue;
+        }
+        const myField = idFields[0];
+        const otherField = idFields[1];
+        const relatedDomain = otherField.field_id.slice(0, -2);
+        if (!resolves(relatedDomain)) continue;
+        if (found.some(r => r.domain === relatedDomain)) continue;
+
+        found.push({
+          domain:        relatedDomain,
+          mode:          "list",
+          fkField:       myField.field_id,
+          junctionTable: entry.table_name,
+          viaField:      otherField.field_id,
+          label:         relatedDomain,
+          // Junction FK columns are plain { type: "string" } with no
+          // relationKind at all in practice, so this reliably falls
+          // back to "association" — exactly right for many-to-many.
+          relationKind: myField.relationKind === "integral" ? "integral" : "association",
+          // Owns / Uses: the junction's owning FK column first, else a
+          // marker field on this domain that points at the related domain.
+          linkMode: toLinkMode(myField.linkMode)
+            ?? toLinkMode(thisFields.find(f =>
+                 String(f.relatedDomain ?? "").toLowerCase() === relatedDomain.toLowerCase())?.linkMode),
+        });
+        continue;
+      }
+
+      const fkField = fields.find(f => pointsAtMe(f.field_id, entry));
+      if (fkField) {
+        found.push({
+          domain:  entry.table_name,
+          mode:    "fk_children",
+          fkField: fkField.field_id,
+          label:   entry.table_name,
+          relationKind: fkField.relationKind === "integral" ? "integral" : "association",
+          linkMode: toLinkMode(fkField.linkMode),
+        });
+      }
+    }
+
+    for (const field of thisFields) {
+      if (field.field_id.endsWith("Id")) {
+        const refDomain = field.field_id.slice(0, -2);
+        if (resolves(refDomain) && (!record || record[field.field_id])) {
+          if (!found.some(r => r.domain === refDomain)) {
+            found.push({
+              domain:  refDomain,
+              mode:    "fk_ref",
+              fkField: field.field_id,
+              label:   refDomain,
+              relationKind: field.relationKind === "integral" ? "integral" : "association",
+            });
+          }
+        }
+        continue;
+      }
+
+      // Many-to-many — a field with cardinality "list" whose value
+      // lives in a junction table (${domainName}_${relatedDomain}),
+      // e.g. entity.grade ↔ entity_grade. relatedDomain/listDomain
+      // cover the flattened shape; related_domain_model.linked_with
+      // covers Schema Inspector's nested design-time shape, in case
+      // that's what ends up in the published schema verbatim.
+      // (In current practice this loop never actually matches, per
+      // the junction-table-based detection above — kept as a
+      // fallback in case some other creation path DOES leave such a
+      // field on the parent's own schema.)
+      const isList = field.type === "list" || (field as any).cardinality === "list";
+      if (!isList) {
+        // Single-valued relation field NOT named "xId" (e.g. an
+        // association stored as "grade"): show the linked record as a tab.
+        const target = field.relatedDomain
+          ? Array.from(domainNames).find(d => String(d).toLowerCase() === String(field.relatedDomain).toLowerCase())
+          : undefined;
+        if (
+          field.type === "relation" && target && !(field as any).isMarkerOnly &&
+          (!record || record[field.field_id]) && !found.some(r => r.domain === target)
+        ) {
+          found.push({
+            domain:  String(target),
+            mode:    "fk_ref",
+            fkField: field.field_id,
+            label:   String(target),
+            relationKind: field.relationKind === "integral" ? "integral" : "association",
+          });
+        }
+        continue;
+      }
+      const relatedDomain =
+        field.relatedDomain || field.listDomain ||
+        (field as any).related_domain_model?.linked_with;
+      if (!relatedDomain || !resolves(relatedDomain)) continue;
+      if (found.some(r => r.domain === relatedDomain)) continue;
+
+      const relationKind =
+        field.relationKind ||
+        (field as any).related_domain_model?.kind;
+
+      found.push({
+        domain:        relatedDomain,
+        mode:          "list",
+        fkField:       `${domainName}Id`,
+        junctionTable: `${domainName}_${relatedDomain}`,
+        viaField:      `${relatedDomain}Id`,
+        label:         relatedDomain,
+        relationKind:  relationKind === "integral" ? "integral" : "association",
+        linkMode:      toLinkMode(field.linkMode),
+      });
+    }
+
+    // Both "integral" and "association" relations get a tab — you
+    // still want to see/link Grades on an Entity even though Grade
+    // isn't owned by Entity. What "integral" actually gates is the
+    // forced multi-step creation flow (see useRelatedSteps in
+    // formplugin.tsx) and the "Add Existing" link action just below
+    // (showLinkActions) — not whether a tab shows up at all.
+    // The project's IDAM user table (User31 / User__31) is not shown as a related tab —
+    // a linked user (owner, lead…) is picked from the field's dropdown instead.
+    // Needs the project suffix, so an ordinary "User" domain is still shown.
+    const HIDDEN_RELATED = /^user_*\d+$/i;
+    // The IDAM user table itself (User__14, User__11_1 …) shows only its Details —
+    // the Task / Output links that point AT a user are not listed on the user's record.
+    const isIdamUserTable = /^user__(?:\d+|np)(?:_\d+)?$/i.test(domainName);
+    const shown = isIdamUserTable
+      ? []
+      : found.filter(r => !HIDDEN_RELATED.test(r.domain) && !HIDDEN_RELATED.test(r.label));
+    // Debug aid: shows why related tabs are (not) built. Remove once published pages match the builder.
+    console.info('[related-tabs]', {
+      domainName,
+      activeProject: getActiveProject(),
+      schemasReturned: schemas.length,
+      ownSchemaFound: !!thisSchema,
+      ownSchemaTable: thisSchema?.table_name ?? null,
+      projectOfThisTable: projectId,
+      relationsFound: found.map(r => `${r.mode}:${r.domain}`),
+      relationsShown: shown.map(r => `${r.mode}:${r.domain}`),
+    });
+    return shown;
+}
+
 export function useRelations(domainName: string, record: Record<string, any>) {
   const [relations, setRelations] = useState<RelationInfo[]>([]);
   const [loading, setLoading]     = useState(true);
@@ -80,235 +320,7 @@ export function useRelations(domainName: string, record: Record<string, any>) {
     setLoading(true);
     fetchAllSchemas()
       .then(res => {
-        const found: RelationInfo[] = [];
-        const schemas = res.schemas ?? [];
-        const domainNames = new Set(schemas.map(s => s.table_name));
-
-        // This domain's own fields — read up front so a relation can pick up
-        // its Owns / Uses label from a marker field declared on this domain.
-        const thisSchema = schemas.find(s => s.table_name === domainName);
-        const thisFields: SchemaField[] = thisSchema
-          ? (Array.isArray(thisSchema.schema)
-              ? thisSchema.schema
-              : Object.values(thisSchema.schema ?? {}))
-          : [];
-
-        // Tables are stored per project as "<Name>__<projectId>" (Client__31) while
-        // link fields and junction columns only carry the plain name ("Output",
-        // "User31"). Resolve plain names against THIS record's project so a
-        // same-named table of another project (e.g. project 30's "Output") is
-        // never used, and a table with no unsuffixed twin is still found.
-        const projectId = thisSchema?.project_id != null ? String(thisSchema.project_id) : null;
-        const inScope = (e: { project_id?: string | null }) =>
-          projectId == null || e.project_id == null || String(e.project_id) === projectId;
-        const baseOf = (e: any) => String(e.domain_name || e.table_name);
-        const myTable = domainName.toLowerCase();
-        const myBase  = (thisSchema ? baseOf(thisSchema) : domainName).toLowerCase();
-        /** Is `fieldId` the FK column that points at THIS domain (as declared by `entry`)? */
-        const pointsAtMe = (fieldId: string, entry: { project_id?: string | null }) => {
-          const f = fieldId.toLowerCase();
-          return f === `${myTable}id` || (inScope(entry) && f === `${myBase}id`);
-        };
-        /** A plain domain name → true when this project has a table for it. */
-        const resolves = (name: string) => {
-          const n = name.toLowerCase();
-          return schemas.some(s2 => inScope(s2) && (
-            s2.table_name.toLowerCase() === n ||
-            s2.table_name.replace(/_/g, "").toLowerCase() === n ||
-            baseOf(s2).toLowerCase() === n));
-        };
-
-        for (const entry of schemas) {
-          if (entry.table_name === domainName) continue;
-          const fields: SchemaField[] = Array.isArray(entry.schema)
-            ? entry.schema
-            : Object.values(entry.schema ?? {});
-
-          if (isJunctionLike(fields)) {
-            // Many-to-many — Schema Inspector never puts anything on the
-            // parent domain's OWN schema for this (no marker field, no
-            // "list"-type column at all — confirmed straight from its
-            // CreateDomainTab.buildPayloadFor: "purely creates the
-            // junction table, nothing added to THIS domain's field
-            // list"). So the only place this relationship is recorded is
-            // the junction table's own two FK columns — resolve directly
-            // from those instead of looking for something on `domainName`
-            // that will never exist.
-            //
-            // Only shown on the side that actually declared it, not both
-            // directions symmetrically — Schema Inspector always writes
-            // ${owningDomain}Id first and ${relatedDomain}Id second (e.g.
-            // building entity→grade from inside "entity" produces
-            // [entityId, gradeId] in exactly that order), so the first
-            // Id field in the junction is the owning side. If it doesn't
-            // match domainName, this domain is the TARGET of someone
-            // else's relation, not the owner — skip it, same as an
-            // fk_ref column only ever producing a tab on the domain that
-            // actually holds it, never a symmetric one on the far side.
-            const idFields = fields.filter(f => f.field_id.endsWith("Id"));
-            if (idFields.length < 2) continue;
-            if (!pointsAtMe(idFields[0].field_id, entry)) {
-              // This domain is the TARGET side of the link (e.g. College in
-              // University_College). It still gets a tab, but a read-only
-              // one: only the records assigned to this record, with just
-              // Edit / Delete — linking is managed from the owning side.
-              if (pointsAtMe(idFields[1].field_id, entry)) {
-                // The junction's owning side is marked "owns" (e.g. Client owns Output):
-                // the owned record doesn't list its owner back, so no tab here.
-                if (toLinkMode(idFields[0].linkMode) === "owns") continue;
-                const ownerDomain = idFields[0].field_id.slice(0, -2);
-                if (resolves(ownerDomain) && !found.some(r => r.domain === ownerDomain)) {
-                  found.push({
-                    domain:        ownerDomain,
-                    mode:          "list",
-                    fkField:       idFields[1].field_id,
-                    junctionTable: entry.table_name,
-                    viaField:      idFields[0].field_id,
-                    label:         ownerDomain,
-                    relationKind:  "association",
-                    reverse:       true,
-                  });
-                }
-              }
-              continue;
-            }
-            const myField = idFields[0];
-            const otherField = idFields[1];
-            const relatedDomain = otherField.field_id.slice(0, -2);
-            if (!resolves(relatedDomain)) continue;
-            if (found.some(r => r.domain === relatedDomain)) continue;
-
-            found.push({
-              domain:        relatedDomain,
-              mode:          "list",
-              fkField:       myField.field_id,
-              junctionTable: entry.table_name,
-              viaField:      otherField.field_id,
-              label:         relatedDomain,
-              // Junction FK columns are plain { type: "string" } with no
-              // relationKind at all in practice, so this reliably falls
-              // back to "association" — exactly right for many-to-many.
-              relationKind: myField.relationKind === "integral" ? "integral" : "association",
-              // Owns / Uses: the junction's owning FK column first, else a
-              // marker field on this domain that points at the related domain.
-              linkMode: toLinkMode(myField.linkMode)
-                ?? toLinkMode(thisFields.find(f =>
-                     String(f.relatedDomain ?? "").toLowerCase() === relatedDomain.toLowerCase())?.linkMode),
-            });
-            continue;
-          }
-
-          const fkField = fields.find(f => pointsAtMe(f.field_id, entry));
-          if (fkField) {
-            found.push({
-              domain:  entry.table_name,
-              mode:    "fk_children",
-              fkField: fkField.field_id,
-              label:   entry.table_name,
-              relationKind: fkField.relationKind === "integral" ? "integral" : "association",
-              linkMode: toLinkMode(fkField.linkMode),
-            });
-          }
-        }
-
-        for (const field of thisFields) {
-          if (field.field_id.endsWith("Id")) {
-            const refDomain = field.field_id.slice(0, -2);
-            if (resolves(refDomain) && record[field.field_id]) {
-              if (!found.some(r => r.domain === refDomain)) {
-                found.push({
-                  domain:  refDomain,
-                  mode:    "fk_ref",
-                  fkField: field.field_id,
-                  label:   refDomain,
-                  relationKind: field.relationKind === "integral" ? "integral" : "association",
-                });
-              }
-            }
-            continue;
-          }
-
-          // Many-to-many — a field with cardinality "list" whose value
-          // lives in a junction table (${domainName}_${relatedDomain}),
-          // e.g. entity.grade ↔ entity_grade. relatedDomain/listDomain
-          // cover the flattened shape; related_domain_model.linked_with
-          // covers Schema Inspector's nested design-time shape, in case
-          // that's what ends up in the published schema verbatim.
-          // (In current practice this loop never actually matches, per
-          // the junction-table-based detection above — kept as a
-          // fallback in case some other creation path DOES leave such a
-          // field on the parent's own schema.)
-          const isList = field.type === "list" || (field as any).cardinality === "list";
-          if (!isList) {
-            // Single-valued relation field NOT named "xId" (e.g. an
-            // association stored as "grade"): show the linked record as a tab.
-            const target = field.relatedDomain
-              ? Array.from(domainNames).find(d => String(d).toLowerCase() === String(field.relatedDomain).toLowerCase())
-              : undefined;
-            if (
-              field.type === "relation" && target && !(field as any).isMarkerOnly &&
-              record[field.field_id] && !found.some(r => r.domain === target)
-            ) {
-              found.push({
-                domain:  String(target),
-                mode:    "fk_ref",
-                fkField: field.field_id,
-                label:   String(target),
-                relationKind: field.relationKind === "integral" ? "integral" : "association",
-              });
-            }
-            continue;
-          }
-          const relatedDomain =
-            field.relatedDomain || field.listDomain ||
-            (field as any).related_domain_model?.linked_with;
-          if (!relatedDomain || !resolves(relatedDomain)) continue;
-          if (found.some(r => r.domain === relatedDomain)) continue;
-
-          const relationKind =
-            field.relationKind ||
-            (field as any).related_domain_model?.kind;
-
-          found.push({
-            domain:        relatedDomain,
-            mode:          "list",
-            fkField:       `${domainName}Id`,
-            junctionTable: `${domainName}_${relatedDomain}`,
-            viaField:      `${relatedDomain}Id`,
-            label:         relatedDomain,
-            relationKind:  relationKind === "integral" ? "integral" : "association",
-            linkMode:      toLinkMode(field.linkMode),
-          });
-        }
-
-        // Both "integral" and "association" relations get a tab — you
-        // still want to see/link Grades on an Entity even though Grade
-        // isn't owned by Entity. What "integral" actually gates is the
-        // forced multi-step creation flow (see useRelatedSteps in
-        // formplugin.tsx) and the "Add Existing" link action just below
-        // (showLinkActions) — not whether a tab shows up at all.
-        // The project's IDAM user table (User31 / User__31) is not shown as a related tab —
-        // a linked user (owner, lead…) is picked from the field's dropdown instead.
-        // Needs the project suffix, so an ordinary "User" domain is still shown.
-        const HIDDEN_RELATED = /^user_*\d+$/i;
-        // The IDAM user table itself (User__14, User__11_1 …) shows only its Details —
-        // the Task / Output links that point AT a user are not listed on the user's record.
-        const isIdamUserTable = /^user__(?:\d+|np)(?:_\d+)?$/i.test(domainName);
-        const shown = isIdamUserTable
-          ? []
-          : found.filter(r => !HIDDEN_RELATED.test(r.domain) && !HIDDEN_RELATED.test(r.label));
-        // Debug aid: shows why related tabs are (not) built. Remove once published pages match the builder.
-        console.info('[related-tabs]', {
-          domainName,
-          activeProject: getActiveProject(),
-          schemasReturned: schemas.length,
-          ownSchemaFound: !!thisSchema,
-          ownSchemaTable: thisSchema?.table_name ?? null,
-          projectOfThisTable: projectId,
-          relationsFound: found.map(r => `${r.mode}:${r.domain}`),
-          relationsShown: shown.map(r => `${r.mode}:${r.domain}`),
-        });
-        setRelations(shown);
+        setRelations(computeRelations(res.schemas ?? [], domainName, record));
       })
       .catch((e) => {
         console.error('[related-tabs] could not load schemas -> no related tabs:', e);
@@ -567,8 +579,66 @@ function RelatedRowEditor({
 
 // ─── Related Grid Tab — one relation's own data ─────────────────────────────
 
+/** Store key under which a related tab's rows are cached (shared with the detail view). */
+export function relatedCacheKey(parentDomain: string, parentId: string, relation: RelationInfo) {
+  return `related:${parentDomain}:${parentId}:${relation.mode}-${relation.domain}`;
+}
+
+/** Loads a relation's rows into the shared store without rendering anything, so the
+ *  detail view can build tabs from their values before the related tab is ever opened. */
+export function RelatedRowsPrefetch({
+  relation, parentDomain, record,
+}: { relation: RelationInfo; parentDomain: string; record: Record<string, any> }) {
+  const parentId = String(record.id ?? "");
+  const cacheKey = relatedCacheKey(parentDomain, parentId, relation);
+  const setStoreRows = useDomainDataStore((s) => s.setRows);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        let result: Record<string, any>[] = [];
+        if (relation.mode === "fk_children") {
+          const domainRows = await fetchDomainRows(relation.domain);
+          result = domainRows.filter(r => String(r[relation.fkField]) === parentId);
+        } else if (relation.mode === "list") {
+          const [junctionRows, domainRows] = await Promise.all([
+            fetchDomainRows(relation.junctionTable!).catch(() => []),
+            fetchDomainRows(relation.domain).catch(() => []),
+          ]);
+          const linked = new Set(
+            junctionRows
+              .filter(r => String(r[relation.fkField]) === parentId)
+              .map(r => String(r[relation.viaField!] ?? ""))
+              .filter(Boolean),
+          );
+          result = domainRows.filter(r => linked.has(String(r.id)));
+        } else {
+          const refId = String(record[relation.fkField] ?? "");
+          const domainRows = await fetchDomainRows(relation.domain);
+          const found = domainRows.find(r => String(r.id) === refId);
+          result = found ? [found] : [];
+        }
+        if (!cancelled) setStoreRows(cacheKey, result);
+      } catch { /* the related tab itself reports load errors */ }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [relation.domain, relation.fkField, relation.mode, parentId, cacheKey]);
+
+  return null;
+}
+
+/** How a related-domain tab lays out its rows: one table, or one Group-tabs
+ *  tab per distinct value of `attribute` (remaining attributes as a table). */
+export interface RelatedDisplay {
+  mode?: "table" | "tabs";
+  attribute?: string;
+}
+
 export function RelatedTab({
   relation, record, allRows, parentDomain, onOpenRecord,
+  display, tabBar, groupFilter,
 }: {
   relation: RelationInfo;
   record: Record<string, any>;
@@ -576,14 +646,22 @@ export function RelatedTab({
   parentDomain: string;
   /** When given, clicking a row opens that related record's own detail view. */
   onOpenRecord?: (domain: string, row: Record<string, any>) => void;
+  /** Table / Tabs choice for this related tab, set in the Data Grid's Configuration panel. */
+  display?: RelatedDisplay;
+  /** Show only the rows whose `attribute` equals `value` (this tab is one value of a
+   *  "tabs by attribute" split, shown in the record's own tab strip). */
+  groupFilter?: { attribute: string; value: string };
+  /** Group-tabs bar look (orientation + colours) used when mode is "tabs". */
+  tabBar?: { tabOrientation?: TabOrientation; tabStyling?: TabStylingConfig };
 }) {
   const parentId = String(record.id ?? "");
+  const domainIdAttrs = useDomainIdAttrs(relation.domain);
 
   // Own cache entry, distinct from ListView's ("grid:...") and from any
   // other RelatedTab instance — scoped to this exact parent record +
   // relation, since the rows here are filtered/found relative to THIS
   // parentId, not shareable with a different record's same-domain tab.
-  const cacheKey = `related:${parentDomain}:${parentId}:${relation.mode}-${relation.domain}`;
+  const cacheKey = relatedCacheKey(parentDomain, parentId, relation);
 
   const rows   = useDomainRows(cacheKey);
   const schema = useDomainSchema(cacheKey) as SchemaField[];
@@ -841,8 +919,64 @@ export function RelatedTab({
     );
   }
  
+  // ── Table / Tabs display ─────────────────────────────────────────────────
+  const attrFields = schema.filter(f => !shouldSkip(f.field_id) && !isRelationField(f));
+  const tabAttribute = display?.attribute && attrFields.some(f => f.field_id === display.attribute)
+    ? display.attribute : "";
+  const showTabs = !groupFilter && display?.mode === "tabs" && !!tabAttribute;
+  const tabCols = cols.filter(c => c !== tabAttribute);
+  const viewRows = groupFilter && rows
+    ? rows.filter(r => String(r[groupFilter.attribute] ?? "") === groupFilter.value)
+    : rows;
+  const viewCols = groupFilter ? cols.filter(c => c !== groupFilter.attribute) : cols;
+  const tabGroups: { key: string; label: string; rows: Record<string, any>[] }[] = [];
+  if (showTabs && rows) {
+    const byKey = new Map<string, Record<string, any>[]>();
+    for (const r of rows) {
+      const k = String(r[tabAttribute] ?? "");
+      const list = byKey.get(k);
+      if (list) list.push(r); else byKey.set(k, [r]);
+    }
+    byKey.forEach((rs, k) => tabGroups.push({ key: k, label: k === "" ? "(empty)" : k, rows: rs }));
+  }
+
+  const renderTable = (tableRows: Record<string, any>[] | null, tableCols: string[]) => (
+    <DataTable
+        columns={tableCols.map(k => ({ key: k, label: schema.find(f => f.field_id === k)?.label || k }))}
+        preserveHeaderCase
+        rows={tableRows}
+        onRowClick={onOpenRecord ? (row) => onOpenRecord(relation.domain, row) : undefined}
+        indexLabel="#"
+        indexValue={(_row, i) => i + 1}
+        emptyText={`No ${relation.domain} records ${showLinkActions ? "added" : "yet"}`}
+        headerBg={headerBg}
+        actions={[
+          {
+            icon: <Pencil className="w-3.5 h-3.5" />,
+            title: `Edit ${capitalize(relation.domain)}`,
+            onClick: (row) => setEditRow(row),
+          },
+          // Remove = unlink only (keeps the record). Not offered for
+          // composition relations, where a child can't live outside its parent.
+          ...(SHOW_UNLINK && showLinkActions ? [{
+            icon: <Link2Off className="w-3.5 h-3.5" />,
+            title: `Remove ${capitalize(relation.domain)} from this ${parentDomain}`,
+            onClick: (row: Record<string, any>) => handleUnlink(row),
+            busy: (row: Record<string, any>) => unlinkingId === actualRowId(row),
+            className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors",
+          }] : []),
+          {
+            icon: <Trash2 className="w-3.5 h-3.5" />,
+            title: `Delete ${capitalize(relation.domain)}`,
+            onClick: (row) => setDeleteRow(row),
+            className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors",
+          },
+        ]}
+      />
+  );
+
 return (
-    <div className="flex flex-col gap-3 relative">
+    <div {...domainIdAttrs} className="flex flex-col gap-3 relative">
       {unlinkError && <p className="text-xs text-destructive/70">{unlinkError}</p>}
       {deleteRow && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm rounded-xl">
@@ -890,38 +1024,27 @@ return (
           </div>
         </div>
       )}
-      <DataTable
-        columns={cols.map(k => ({ key: k, label: schema.find(f => f.field_id === k)?.label || k }))}
-        preserveHeaderCase
-        rows={rows}
-        onRowClick={onOpenRecord ? (row) => onOpenRecord(relation.domain, row) : undefined}
-        indexLabel="#"
-        indexValue={(_row, i) => i + 1}
-        emptyText={`No ${relation.domain} records ${showLinkActions ? "added" : "yet"}`}
-        headerBg={headerBg}
-        actions={[
-          {
-            icon: <Pencil className="w-3.5 h-3.5" />,
-            title: `Edit ${capitalize(relation.domain)}`,
-            onClick: (row) => setEditRow(row),
-          },
-          // Remove = unlink only (keeps the record). Not offered for
-          // composition relations, where a child can't live outside its parent.
-          ...(SHOW_UNLINK && showLinkActions ? [{
-            icon: <Link2Off className="w-3.5 h-3.5" />,
-            title: `Remove ${capitalize(relation.domain)} from this ${parentDomain}`,
-            onClick: (row: Record<string, any>) => handleUnlink(row),
-            busy: (row: Record<string, any>) => unlinkingId === actualRowId(row),
-            className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors",
-          }] : []),
-          {
-            icon: <Trash2 className="w-3.5 h-3.5" />,
-            title: `Delete ${capitalize(relation.domain)}`,
-            onClick: (row) => setDeleteRow(row),
-            className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors",
-          },
-        ]}
-      />
+      {showTabs ? (
+        tabGroups.length === 0 ? (
+          <Empty text={`No ${relation.domain} records ${showLinkActions ? "added" : "yet"} — tabs by "${attrFields.find(f => f.field_id === tabAttribute)?.label?.trim() || tabAttribute}" appear once there are records.`} />
+        ) : (
+          <div className="min-h-[220px]">
+            <DomainTabsCanvas
+              configs={{
+                tabOrientation: tabBar?.tabOrientation,
+                tabStyling: tabBar?.tabStyling,
+                _orientationInit: true,
+              }}
+              isPreview
+              tabsOverride={tabGroups.map(g => ({ key: g.key, label: g.label }))}
+              renderTabContent={(tab) => {
+                const g = tabGroups.find(x => x.key === tab.key);
+                return g ? renderTable(g.rows, tabCols) : null;
+              }}
+            />
+          </div>
+        )
+      ) : renderTable(viewRows, viewCols)}
     </div>
   );
 }

@@ -21,10 +21,16 @@ import { executeSavedQuery } from '../api/queryBuilderApi';
 import {
   type SchemaField, type RelationInfo,
   rowId, rowLabel, fmt, SKIP, shouldSkip, isRelationField, isPlainMultiValue, isRowActive, useThemeColors,
-  capitalize, Loading, Empty,
+  capitalize, Loading, Empty, useDomainIdAttrs,
 } from './domainListShared';
-import { useRelations, RelatedTab, isJunctionLike } from './relatedRecordsPlugin';
+import {
+  useRelations, RelatedTab, RelatedRowsPrefetch, relatedCacheKey, computeRelations, type RelatedDisplay,
+} from './relatedRecordsPlugin';
 import { can } from '../lib/permissions';
+import {
+  DomainTabsCanvas, TabOrientationSetting, ColorField,
+  type TabOrientation, type TabStylingConfig,
+} from './domainTabsPlugin';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +45,12 @@ type DomainListConfigs = {
   title:        string;
   showCreate:   boolean;
   createLabel:  string;
+  /** Group Tabs bar options (orientation + colours) for the record's tab strip. */
+  tabOrientation?: TabOrientation;
+  tabStyling?: TabStylingConfig;
+  /** Per related-domain tab (keyed like `fk_children-service`) display choice
+   *  shown inside a record's detail view: table, or tabs by an attribute. */
+  relatedDisplay?: Record<string, RelatedDisplay>;
   visualStyle?: Partial<VisualStyleConfig>;
   tabConfig?:  TabConfigItem[];
   /** Domain tabs added ad-hoc from the "+" button in DetailView, on top
@@ -79,14 +91,33 @@ function computeAvailableTabs(
   return tabs;
 }
 
+/** Finds a domain's related domains (one-to-many, many-to-many, references) — the
+ *  same discovery the Tabs setting and the "Related Tabs Display" setting share. */
+async function fetchRelationsFor(
+  domainName: string,
+): Promise<{ versioned: boolean; relations: RelationInfo[]; schemas: any[] }> {
+  const [schemaRes, allRes] = await Promise.all([
+    fetchDomainSchema(domainName).catch(() => ({ schema: [], versioned: false } as any)),
+    fetchAllSchemas().catch(() => ({ schemas: [] })),
+  ]);
+  return {
+    versioned: !!(schemaRes as any).versioned,
+    relations: computeRelations((allRes as any).schemas ?? [], domainName, null),
+    schemas: (allRes as any).schemas ?? [],
+  };
+}
+
 function TabOrderSetting({
-  value, onChange, configs,
+  value, onChange, configs, selectedInstance, dataSourceId,
 }: {
   value?: TabConfigItem[];
   onChange: (v: TabConfigItem[]) => void;
   configs?: Record<string, any>;
+  selectedInstance?: any;
+  dataSourceId?: string | number | null;
 }) {
-  const domainName = (configs?.dataSourceId != null ? String(configs.dataSourceId) : "").trim();
+  const sourceId = dataSourceId ?? configs?.dataSourceId ?? selectedInstance?.dataSourceId;
+  const domainName = (sourceId != null ? String(sourceId) : "").trim();
   const [loading, setLoading]     = useState(true);
   const [available, setAvailable] = useState<TabConfigItem[]>([]);
 
@@ -94,79 +125,9 @@ function TabOrderSetting({
     if (!domainName) { setAvailable([]); setLoading(false); return; }
     setLoading(true);
 
-    Promise.all([
-      fetchDomainSchema(domainName).catch(() => ({ schema: [], versioned: false } as any)),
-      fetchAllSchemas().catch(() => ({ schemas: [] })),
-    ]).then(([schemaRes, allRes]) => {
-      const versioned = !!(schemaRes as any).versioned;
-      const schemas = (allRes as any).schemas ?? [];
-      const relations: RelationInfo[] = [];
-      const domainNames = new Set(schemas.map((s: any) => s.table_name));
-
-      const fkChildField = `${domainName}Id`;
-      for (const entry of schemas) {
-        if (entry.table_name === domainName) continue;
-        const fields: SchemaField[] = Array.isArray(entry.schema)
-          ? entry.schema
-          : Object.values(entry.schema ?? {});
-
-        if (isJunctionLike(fields)) {
-          // Many-to-many — only shown on the side that declared it (the
-          // first Id field in the junction, per Schema Inspector's
-          // ${owningDomain}Id-first convention). See relatedRecordsPlugin
-          // .tsx's useRelations for the full explanation.
-          const idFields = fields.filter(f => f.field_id.endsWith("Id"));
-          if (idFields.length < 2 || idFields[0].field_id !== fkChildField) continue;
-          const myField = idFields[0];
-          const otherField = idFields[1];
-          const relatedDomain = otherField.field_id.slice(0, -2);
-          if (!domainNames.has(relatedDomain)) continue;
-          if (relations.some(r => r.domain === relatedDomain)) continue;
-
-          relations.push({
-            domain: relatedDomain,
-            mode: "list",
-            fkField: fkChildField,
-            junctionTable: entry.table_name,
-            viaField: otherField.field_id,
-            label: relatedDomain,
-            relationKind: myField.relationKind === "integral" ? "integral" : "association",
-          });
-          continue;
-        }
-
-        const fkField = fields.find(f => f.field_id === fkChildField);
-        if (fkField) {
-          relations.push({
-            domain: entry.table_name,
-            mode: "fk_children",
-            fkField: fkChildField,
-            label: entry.table_name,
-            relationKind: fkField.relationKind === "integral" ? "integral" : "association",
-          });
-        }
-      }
-
-      const thisSchema = schemas.find((s: any) => s.table_name === domainName);
-      const thisFields: SchemaField[] = thisSchema
-        ? (Array.isArray(thisSchema.schema) ? thisSchema.schema : Object.values(thisSchema.schema ?? {}))
-        : [];
-      for (const field of thisFields) {
-        if (!field.field_id.endsWith("Id")) continue;
-        const refDomain = field.field_id.slice(0, -2);
-        if (domainNames.has(refDomain) && !relations.some(r => r.domain === refDomain)) {
-          relations.push({
-            domain: refDomain,
-            mode: "fk_ref",
-            fkField: field.field_id,
-            label: refDomain,
-            relationKind: field.relationKind === "integral" ? "integral" : "association",
-          });
-        }
-      }
-
-      setAvailable(computeAvailableTabs(versioned, relations));
-    }).finally(() => setLoading(false));
+    fetchRelationsFor(domainName)
+      .then(({ versioned, relations }) => setAvailable(computeAvailableTabs(versioned, relations)))
+      .finally(() => setLoading(false));
   }, [domainName]);
 
   const merged: TabConfigItem[] = React.useMemo(() => {
@@ -235,6 +196,124 @@ function TabOrderSetting({
   );
 }
 
+
+// ─── Related Tabs Display (Configuration panel) ──────────────────────────────
+// For every related domain shown as a tab in a record's detail view (e.g.
+// "Services" under a Client), choose: a normal table, or one tab per distinct
+// value of an attribute of that domain (remaining attributes as a table inside).
+
+function RelatedDisplaySetting({
+  value, onChange, configs, selectedInstance, dataSourceId, sourceType,
+}: {
+  value?: Record<string, RelatedDisplay>;
+  onChange: (v: Record<string, RelatedDisplay>) => void;
+  configs?: Record<string, any>;
+  selectedInstance?: any;
+  dataSourceId?: string | number | null;
+  sourceType?: string;
+}) {
+  const sourceId = dataSourceId ?? configs?.dataSourceId ?? selectedInstance?.dataSourceId;
+  const domainName = (sourceId != null ? String(sourceId) : "").trim();
+  const isQuery = (sourceType ?? configs?.type ?? selectedInstance?.type) === "query" ||
+    (sourceType ?? configs?.type ?? selectedInstance?.type) === "state";
+  const [loading, setLoading] = useState(true);
+  const [items, setItems] = useState<{ key: string; domain: string; attrs: { id: string; label: string }[] }[]>([]);
+  const cur = value ?? {};
+
+  useEffect(() => {
+    if (!domainName || isQuery) { setItems([]); setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true);
+    fetchRelationsFor(domainName)
+      .then(async ({ relations, schemas }) => {
+        const out = await Promise.all(relations.map(async rel => {
+          // Same schema the grid's own columns use (so field ids and labels match the
+          // row data); the domain-list schema is only a fallback.
+          const res = await fetchDomainSchema(rel.domain).catch(() => ({ schema: [] } as any));
+          let fields: SchemaField[] = (res as any).schema ?? [];
+          if (fields.length === 0) {
+            const entry = schemas.find((s: any) => s.table_name === rel.domain);
+            fields = entry
+              ? (Array.isArray(entry.schema) ? entry.schema : Object.values(entry.schema ?? {}))
+              : [];
+          }
+          const attrs = fields
+            .filter((f: SchemaField) => f && f.field_id && !shouldSkip(f.field_id) && !isRelationField(f))
+            .map((f: SchemaField) => ({ id: f.field_id, label: f.label?.trim() || f.field_id }));
+          return { key: `${rel.mode}-${rel.domain}`, domain: rel.domain, attrs };
+        }));
+        if (!cancelled) setItems(out);
+      })
+      .catch(() => { if (!cancelled) setItems([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [domainName, isQuery]);
+
+  const set = (key: string, patch: RelatedDisplay) =>
+    onChange({ ...cur, [key]: { ...(cur[key] ?? {}), ...patch } });
+
+  if (!domainName || isQuery) {
+    return (
+      <p className="text-xs text-muted-foreground/40 italic">
+        {isQuery ? "Related tabs apply to table data sources only." : "Select a domain first to configure related tabs."}
+      </p>
+    );
+  }
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 h-9 px-3 rounded-lg border border-border bg-card/50 text-muted-foreground/40 text-xs">
+        <Loader2 className="w-3 h-3 animate-spin" /> Loading related domains…
+      </div>
+    );
+  }
+  if (items.length === 0) {
+    return <p className="text-xs text-muted-foreground/40 italic">No related domains found for {domainName}.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {items.map(it => {
+        const d = cur[it.key] ?? {};
+        const mode = d.mode === "tabs" ? "tabs" : "table";
+        return (
+          <div key={it.key} className="flex flex-col gap-2 bg-secondary/20 rounded-lg p-3 border border-border">
+            <p className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground/50">{capitalize(it.domain)}</p>
+            <div role="radiogroup" aria-label={`${it.domain} display`} className="flex gap-1 p-1 rounded-lg border border-border bg-secondary/30">
+              {(["table", "tabs"] as const).map(m => (
+                <button key={m} type="button" role="radio" aria-checked={mode === m}
+                  onClick={() => set(it.key, { mode: m })}
+                  className={`flex-1 h-8 rounded-md text-xs font-semibold capitalize transition-colors ${
+                    mode === m
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"
+                  }`}>
+                  {m}
+                </button>
+              ))}
+            </div>
+            {mode === "tabs" && (
+              <div>
+                <label className="text-[10px] text-muted-foreground/60 block mb-1">Tab Attribute</label>
+                <select
+                  value={d.attribute ?? ""}
+                  onChange={e => set(it.key, { attribute: e.target.value })}
+                  className="w-full h-9 rounded-lg border border-border bg-background px-3 text-xs outline-none focus:border-primary/60">
+                  <option value="">— select attribute —</option>
+                  {it.attrs.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
+                </select>
+                {!d.attribute && (
+                  <p className="mt-1 text-[10px] text-muted-foreground/50 italic">
+                    Pick the attribute whose values become the tabs.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 // ─── Version History Tab ─────────────────────────────────────────────────────
 
@@ -311,23 +390,10 @@ if (loading) return <Loading text="Loading version history…" />;
 // ─── Add Tab Button — the "+" next to the tab bar ──────────────────────────
 // Just appends a blank tab — no picker, no domain list, nothing to choose.
 
-function AddTabButton({ onAdd }: { onAdd: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onAdd}
-      title="Add a tab"
-      className="flex items-center justify-center w-6 h-6 shrink-0 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary/70 transition-colors">
-      <Plus className="w-3.5 h-3.5" />
-    </button>
-  );
-}
-
-// ─── Detail View ─────────────────────────────────────────────────────────────
-
 function DetailView({
   record, domainName, versioned, onBack, tabConfig = [],
   manualRelations = [], onManualRelationsChange,
+  relatedDisplay, tabBar,
 }: {
   record: Record<string, any>;
   domainName: string;
@@ -338,16 +404,21 @@ function DetailView({
    *  block's configs, not just local state, so they survive re-opening). */
   manualRelations?: { id: string }[];
   onManualRelationsChange?: (next: { id: string }[]) => void;
+  relatedDisplay?: Record<string, RelatedDisplay>;
+  tabBar?: { tabOrientation?: TabOrientation; tabStyling?: TabStylingConfig };
 }) {
   // Relation detection moved into its own hook (relatedRecordsPlugin.tsx) —
   // same logic, now shared/reusable instead of living inline here.
   const { relations, loading: loadingRel } = useRelations(domainName, record);
-  const [activeTab, setActiveTab]   = useState<string>("details");
+  const domainIdAttrs = useDomainIdAttrs(domainName);
   const [allRows] = useState<Record<string, Record<string, any>[]>>({});
   // A row clicked inside a related tab (e.g. an Output under a Client) opens
   // that record's own detail view — with its own tabs — in place of this one.
   const [drill, setDrill] = useState<{ domain: string; row: Record<string, any> } | null>(null);
   const [domainSchema, setDomainSchema] = useState<SchemaField[]>([]);
+  // Cached related rows (filled by RelatedRowsPrefetch / RelatedTab) — used to
+  // turn a "tabs by attribute" related domain into one top-level tab per value.
+  const storeRows = useDomainDataStore((s) => s.rows);
 
 const recordId     = String(record.id ?? "");
   const label        = rowLabel(record);
@@ -383,6 +454,35 @@ const recordId     = String(record.id ?? "");
   const labelFor = (t: TabDef) =>
     tabConfig.find(c => c.key === t.key)?.label?.trim() || t.defaultLabel;
 
+  // A related domain set to "Tabs" is replaced in this strip by one tab per distinct
+  // value of the chosen attribute (e.g. Services → Event | Pr Service). With no rows
+  // yet it stays a single tab so records can still be created.
+  type StripTab = { key: string; label: string; relKey?: string; group?: { attribute: string; value: string } };
+  const splitRelations = relations.filter(r => {
+    const d = relatedDisplay?.[`${r.mode}-${r.domain}`];
+    return d?.mode === "tabs" && !!d.attribute;
+  });
+  const stripTabs: StripTab[] = orderedTabs.flatMap((t): StripTab[] => {
+    const rel = splitRelations.find(r => `${r.mode}-${r.domain}` === t.key);
+    const attribute = rel ? relatedDisplay?.[t.key]?.attribute : undefined;
+    const rowsForRel = rel ? storeRows[relatedCacheKey(domainName, recordId, rel)] : undefined;
+    // No rows, or the saved attribute isn't a column of these rows (stale choice): keep one plain tab.
+    if (!rel || !attribute || !rowsForRel || rowsForRel.length === 0 || !rowsForRel.some(r => attribute in r)) {
+      return [{ key: t.key, label: labelFor(t) }];
+    }
+    const values: string[] = [];
+    for (const r of rowsForRel) {
+      const v = String(r[attribute] ?? "");
+      if (!values.includes(v)) values.push(v);
+    }
+    return values.map(v => ({
+      key: `${t.key}::${v}`,
+      label: v === "" ? "(empty)" : v,
+      relKey: t.key,
+      group: { attribute, value: v },
+    }));
+  });
+
   const { headerBg } = useThemeColors();
 
   if (drill) {
@@ -393,12 +493,14 @@ const recordId     = String(record.id ?? "");
         domainName={drill.domain}
         versioned={false}
         onBack={() => setDrill(null)}
+        relatedDisplay={relatedDisplay}
+        tabBar={tabBar}
       />
     );
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div {...domainIdAttrs} className="flex flex-col h-full">
       <div className="flex items-center gap-3 px-5 py-3 border-b border-border" style={{ backgroundColor: headerBg }}>
         <button onClick={onBack}
           className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors">
@@ -409,104 +511,80 @@ const recordId     = String(record.id ?? "");
         <span className="ml-auto text-[10px] font-mono text-muted-foreground/40">ID: {recordId}</span>
       </div>
 
-{/* Tabs */}
-      <div className="flex items-center border-b border-border px-5 gap-1 overflow-x-auto">
-        {orderedTabs.map(tab => (
-          <button key={tab.key} onClick={() => setActiveTab(tab.key)}
-            className={`px-3 py-2.5 text-xs font-semibold whitespace-nowrap transition-colors border-b-2 -mb-px ${
-              activeTab === tab.key
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground"
-            }`}>
-            {labelFor(tab)}
-          </button>
+      {loadingRel && (
+        <span className="px-5 py-1 text-xs text-muted-foreground/30 flex items-center gap-1">
+          <Loader2 className="w-3 h-3 animate-spin" /> Loading tabs…
+        </span>
+      )}
+
+      {/* Tab bar + content: the Group tabs component in "external" mode — this
+          view supplies the tab list and each tab's content. */}
+      <div className="flex-1 min-h-0">
+        {splitRelations.map(rel => (
+          <RelatedRowsPrefetch key={`${rel.mode}-${rel.domain}`} relation={rel} parentDomain={domainName} record={record} />
         ))}
-
-        {/* Manually-added blank tabs — each removable on hover. */}
-        {manualRelations.map((mr, idx) => {
-          const key = `manual-${mr.id}`;
-          const label = `Tab ${idx + 1}`;
-          return (
-            <div key={key} className="flex items-center group shrink-0">
-              <button onClick={() => setActiveTab(key)}
-                className={`pl-3 pr-1 py-2.5 text-xs font-semibold whitespace-nowrap transition-colors border-b-2 -mb-px ${
-                  activeTab === key
-                    ? "border-primary text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                }`}>
-                {label}
-              </button>
-              <button
-                type="button"
-                title={`Remove ${label}`}
-                onClick={() => {
-                  onManualRelationsChange?.(manualRelations.filter(r => r.id !== mr.id));
-                  if (activeTab === key) setActiveTab("details");
-                }}
-                className="opacity-0 group-hover:opacity-100 mr-1.5 p-0.5 rounded text-muted-foreground/40 hover:text-destructive transition-opacity">
-                <X className="w-3 h-3" />
-              </button>
-            </div>
-          );
-        })}
-
-        {loadingRel && (
-          <span className="px-3 py-2.5 text-xs text-muted-foreground/30 flex items-center gap-1 shrink-0">
-            <Loader2 className="w-3 h-3 animate-spin" /> Loading tabs…
-          </span>
-        )}
-
-        <AddTabButton
-          onAdd={() => {
-            const id = Math.random().toString(36).slice(2, 8);
-            const next = [...manualRelations, { id }];
-            onManualRelationsChange?.(next);
-            setActiveTab(`manual-${id}`);
+        <DomainTabsCanvas
+          configs={{
+            tabOrientation: tabBar?.tabOrientation,
+            tabStyling: tabBar?.tabStyling,
+            _orientationInit: true,
+          }}
+          isPreview
+          tabsOverride={[
+            ...stripTabs.map(t => ({ key: t.key, label: t.label })),
+            ...manualRelations.map((mr, idx) => ({ key: `manual-${mr.id}`, label: `Tab ${idx + 1}`, removable: true })),
+          ]}
+          onAddTab={() =>
+            onManualRelationsChange?.([...manualRelations, { id: Math.random().toString(36).slice(2, 8) }])}
+          onRemoveTab={(key) =>
+            onManualRelationsChange?.(manualRelations.filter(r => `manual-${r.id}` !== key))}
+          renderTabContent={(tab) => {
+            if (tab.key === "details") {
+              return (
+                <div className="grid grid-cols-2 gap-4">
+                  {detailFields.map(([key, val]) => (
+                    <div key={key} className="flex flex-col gap-1">
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground/50">{translateLabel(key, key)}</span>
+                      <span className="text-sm font-medium text-foreground break-words">
+                        {fmt(val) === "—"
+                          ? <span className="text-muted-foreground/30 italic text-xs">—</span>
+                          : typeof val === "string" && val.startsWith("data:image")
+                            ? <img src={val} alt={key} className="w-16 h-16 rounded-lg object-cover border border-border" />
+                            : fmt(val)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              );
+            }
+            if (tab.key === "version-history") {
+              return versioned
+                ? <VersionHistoryTab domainName={domainName} record={record} schema={domainSchema} />
+                : null;
+            }
+            const strip = stripTabs.find(t => t.key === tab.key);
+            const rel = relations.find(r => `${r.mode}-${r.domain}` === (strip?.relKey ?? tab.key));
+            if (rel) {
+              return (
+                <RelatedTab
+                  key={tab.key}
+                  relation={rel}
+                  record={record}
+                  allRows={allRows}
+                  parentDomain={domainName}
+                  onOpenRecord={(domain, row) => setDrill({ domain, row })}
+                  display={relatedDisplay?.[strip?.relKey ?? tab.key]}
+                  groupFilter={strip?.group}
+                  tabBar={tabBar}
+                />
+              );
+            }
+            if (tab.key.startsWith("manual-")) {
+              return <Empty text="Empty tab — nothing configured here yet." />;
+            }
+            return null;
           }}
         />
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-5">
-        {activeTab === "details" && (
-          <div className="grid grid-cols-2 gap-4">
-            {detailFields.map(([key, val]) => (
-              <div key={key} className="flex flex-col gap-1">
-<span className="text-[9px] font-bold uppercase tracking-widest text-muted-foreground/50">{translateLabel(key, key)}</span>               <span className="text-sm font-medium text-foreground break-words">
-                  {fmt(val) === "—"
-                    ? <span className="text-muted-foreground/30 italic text-xs">—</span>
-                    : typeof val === "string" && val.startsWith("data:image")
-                      ? <img src={val} alt={key} className="w-16 h-16 rounded-lg object-cover border border-border" />
-                      : fmt(val)}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {versioned && activeTab === "version-history" && (
-          <VersionHistoryTab domainName={domainName} record={record} schema={domainSchema} />
-        )}
-
-        {relations.map(rel => {
-          const relKey = `${rel.mode}-${rel.domain}`;
-          return activeTab === relKey ? (
-            <RelatedTab
-              key={relKey}
-              relation={rel}
-              record={record}
-              allRows={allRows}
-              parentDomain={domainName}
-              onOpenRecord={(domain, row) => setDrill({ domain, row })}
-            />
-          ) : null;
-        })}
-
-        {manualRelations.map(mr => (
-          activeTab === `manual-${mr.id}` ? (
-            <Empty key={mr.id} text="Empty tab — nothing configured here yet." />
-          ) : null
-        ))}
       </div>
     </div>
   );
@@ -895,6 +973,8 @@ if (selected) {
         tabConfig={configs.tabConfig}
         manualRelations={configs.manualRelations}
         onManualRelationsChange={(next) => updateConfigs?.({ manualRelations: next })}
+        relatedDisplay={configs.relatedDisplay}
+        tabBar={{ tabOrientation: configs.tabOrientation, tabStyling: configs.tabStyling }}
         onBack={() => setSelected(null)}
       />
     );
@@ -909,6 +989,20 @@ if (selected) {
   const listCols = isReadOnlySource
     ? Object.keys(effectiveRows?.[0] ?? {}).filter(k => !SKIP.has(k) && !k.endsWith("Id")).slice(0, 5)
     : schema.filter(f => !SKIP.has(f.field_id) && !isRelationField(f)).map(f => f.field_id).slice(0, 5);
+
+  const renderGrid = (gridRows: Record<string, any>[] | null, cols: string[]) => (
+    <DataTable
+      columns={cols.map(k => ({ key: k, label: translateLabel(k, schema.find(f => f.field_id === k)?.label || k) }))}
+      rows={gridRows}
+      onRowClick={(row) => { if (!isQuerySource) setSelected(row); }}
+      headerBg={headerBg}
+      preserveHeaderCase
+      actions={isReadOnlySource ? [] : [
+        ...(can(domainName, "edit") ? [{ icon: <Pencil className="w-3.5 h-3.5" />, title: "Edit", onClick: (row: Record<string, any>) => setEditRow(row) }] : []),
+        ...(can(domainName, "delete") ? [{ icon: <Trash2 className="w-3.5 h-3.5" />, title: "Delete", onClick: (row: Record<string, any>) => setDeleteRow(row), className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors" }] : []),
+      ]}
+    />
+  );
 
   const archiveCols = schema
     .filter(f => !SKIP.has(f.field_id) && !isRelationField(f))
@@ -1043,17 +1137,7 @@ if (selected) {
         ) : effectiveRows?.length === 0 ? (
           <Empty text={isStateSource ? "No records in the bound state yet" : isQuerySource ? "This query returned no records" : `No records in "${domainName}" yet`} />
         ) : (
-         <DataTable
-            columns={listCols.map(k => ({ key: k, label: translateLabel(k, schema.find(f => f.field_id === k)?.label || k) }))}
-            rows={effectiveRows}
-            onRowClick={(row) => { if (!isQuerySource) setSelected(row); }}
-            headerBg={headerBg}
-            preserveHeaderCase
-            actions={isReadOnlySource ? [] : [
-              ...(can(domainName, "edit") ? [{ icon: <Pencil className="w-3.5 h-3.5" />, title: "Edit", onClick: (row: Record<string, any>) => setEditRow(row) }] : []),
-              ...(can(domainName, "delete") ? [{ icon: <Trash2 className="w-3.5 h-3.5" />, title: "Delete", onClick: (row: Record<string, any>) => setDeleteRow(row), className: "p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors" }] : []),
-            ]}
-          />
+          renderGrid(effectiveRows, listCols)
         )}
       </div>
 
@@ -1095,6 +1179,26 @@ if (selected) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── Tab bar colours (Data grid → Tabs mode) ─────────────────────────────────
+
+function TabBarStyleSetting({
+  value, onChange,
+}: {
+  value?: TabStylingConfig;
+  onChange: (v: TabStylingConfig) => void;
+}) {
+  const cur = value ?? {};
+  const set = (patch: Partial<TabStylingConfig>) => onChange({ ...cur, ...patch });
+  return (
+    <div className="flex flex-col gap-3 bg-secondary/20 rounded-lg p-3 border border-border">
+      <ColorField label="Bar Background" placeholder="#1c212b" value={cur.barBg} onChange={v => set({ barBg: v })} />
+      <ColorField label="Active Tab Background" placeholder="#1a3a30" value={cur.activeBg} onChange={v => set({ activeBg: v })} />
+      <ColorField label="Active Tab Text" placeholder="#34d399" value={cur.activeTextColor} onChange={v => set({ activeTextColor: v })} />
+      <ColorField label="Active Indicator" placeholder="#34d399" value={cur.indicatorColor} onChange={v => set({ indicatorColor: v })} />
     </div>
   );
 }
@@ -1145,11 +1249,32 @@ export const DomainListPlugin: ViewBuilderPlugin<DomainListConfigs, Record<strin
       showWhen: (c) => !!c.showCreate,
     },
     {
+      field_id: "tabOrientation",
+      label: "Tab Orientation",
+      type: "custom",
+      defaultValue: "horizontal",
+      component: TabOrientationSetting,
+    },
+    {
+      field_id: "tabStyling",
+      label: "Tab Bar Colors",
+      type: "custom",
+      defaultValue: {},
+      component: TabBarStyleSetting,
+    },
+    {
       field_id: "tabConfig",
       label: "Tabs",
       type: "custom",
       defaultValue: [],
       component: TabOrderSetting,
+    },
+    {
+      field_id: "relatedDisplay",
+      label: "Related Tabs Display",
+      type: "custom",
+      defaultValue: {},
+      component: RelatedDisplaySetting,
     },
   ],
 

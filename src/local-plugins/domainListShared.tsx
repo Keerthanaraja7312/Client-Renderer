@@ -11,6 +11,40 @@ import React from "react";
 import { LayoutList, Loader2 } from "lucide-react";
 import { useVisualStyle } from "../sky-view-builder/styles/withVisualStyle";
 import { colorUtils } from "../sky-view-builder/styles/visualStyles";
+import { fetchDomainSchema } from "../api/datastoreApi";
+
+// ─── HTML id attributes for a domain's div ─────────────────────────────────
+// Spread onto a <div>: gives it id="domain-<table>" plus data-project-id /
+// data-module-id so the ids are visible in the DOM (DevTools → Elements).
+
+const _domainMetaCache = new Map<string, Promise<{ table?: string; project_id?: string | null; module_id?: string | null }>>();
+function loadDomainMeta(name: string) {
+  let p = _domainMetaCache.get(name);
+  if (!p) {
+    p = fetchDomainSchema(name)
+      .then(r => ({ table: r.table_name, project_id: r.project_id, module_id: r.module_id }))
+      .catch(() => { _domainMetaCache.delete(name); return {}; });
+    _domainMetaCache.set(name, p);
+  }
+  return p;
+}
+
+export function useDomainIdAttrs(tableName?: string | null) {
+  const [meta, setMeta] = React.useState<{ table?: string; project_id?: string | null; module_id?: string | null }>({});
+  React.useEffect(() => {
+    if (!tableName) { setMeta({}); return; }
+    let cancelled = false;
+    loadDomainMeta(tableName).then(m => { if (!cancelled) setMeta(m); });
+    return () => { cancelled = true; };
+  }, [tableName]);
+  const table = meta.table ?? tableName ?? undefined;
+  return {
+    id: table ? `domain-${table}` : undefined,
+    'data-domain': table,
+    'data-project-id': meta.project_id ?? undefined,
+    'data-module-id': meta.module_id ?? undefined,
+  } as React.HTMLAttributes<HTMLDivElement>;
+}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 

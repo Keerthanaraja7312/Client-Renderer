@@ -47,6 +47,12 @@ export interface SettingFieldDefinition {
      * Optional metadata for auto-populating field options from available state/data bindings.
      */
     optionsFrom?: 'state' | 'dataField' | 'stateAndData';
+    /**
+     * Optional: hide this field in the settings panel unless the predicate
+     * returns true for the instance's current configs (e.g. a "tab attribute"
+     * picker that only matters when display mode is "tabs").
+     */
+    visibleWhen?: (configs: Record<string, any>) => boolean;
 }
 
 /**

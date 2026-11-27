@@ -266,42 +266,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ selectedInstance, 
                     </span>
                   </div>
 
-                  {sourceType === 'table' && (projectScope.enabled || projectScope.loading) && (
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] font-medium text-muted-foreground/60 uppercase tracking-tight">Project</label>
-                      <div className="relative">
-                        <select
-                          className="w-full bg-primary/5 border border-primary/20 rounded-xl p-3 text-sm focus:ring-2 focus:ring-primary outline-none appearance-none cursor-pointer transition-all font-bold text-primary disabled:opacity-50"
-                          value={projectScope.projectId ?? ''}
-                          disabled={projectScope.loading}
-                          onChange={(e) => {
-                            const next = e.target.value || null;
-                            projectScope.setProjectId(next);
-                            // Switching project invalidates a table from the old one.
-                            if (next !== projectScope.projectId && effectiveDataSourceId) {
-                              onUpdateConfig({ dataSourceId: null, type: 'table' });
-                            }
-                          }}
-                        >
-                          <option value="">{projectScope.loading ? 'Loading projects…' : 'Select Project...'}</option>
-                          {projectScope.projectOptions.map(o => (
-                            <option key={o.value} value={o.value}>{o.label}</option>
-                          ))}
-                        </select>
-                        <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-primary/40">↓</div>
-                      </div>
-                      
-                    </div>
-                  )}
-
-                  {sourceType === 'table' && projectScope.error && (
-                    <p className="text-[10px] text-destructive">{projectScope.error} Showing all tables.</p>
-                  )}
                   <div className="relative">
                     <select
                       className="w-full bg-primary/5 border border-primary/20 rounded-xl p-3 text-sm focus:ring-2 focus:ring-primary outline-none appearance-none cursor-pointer transition-all font-bold text-primary disabled:opacity-50"
                       value={effectiveDataSourceId ?? ''}
-                      disabled={sourceType === 'table' && projectScope.enabled && !projectScope.projectId}
                       onChange={(e) => {
                         const sourceId = e.target.value;
                         const source = availableFields.find(s => String(s.id) === String(sourceId));
@@ -312,7 +280,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ selectedInstance, 
                       }}
                     >
                       <option value="">
-                        {sourceType === 'table' && projectScope.enabled && !projectScope.projectId ? 'Select a project first...' : 'Select Table/Query...'}
+                        Select Table/Query...
                       </option>
                       {(sourceType === 'table' ? projectScope.scopedSources : availableFields.filter(source => source.type === sourceType))
                         .map(source => (
@@ -376,7 +344,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ selectedInstance, 
               </div>
             ) : null}
 
-            {selectedPlugin?.settings.map(field => (
+            {selectedPlugin?.settings
+              .filter(field => !field.visibleWhen || field.visibleWhen(selectedInstance.configs ?? {}))
+              .map(field => (
               <div key={field.field_id} className="space-y-3">
                 <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">{field.label}</label>
 

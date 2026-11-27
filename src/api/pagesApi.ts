@@ -24,12 +24,12 @@ export interface PageSummary {
   published_version: number | null;
   latest_version: number | null;
   has_draft: boolean;
+  /** Project the page was published under (null = none). */
+  project_id?: number | null;
   updated_at: string;
   visibility: PageVisibility;
   allowed_emails: string[];
   allowed_roles: string[];
-  /** Project the page belongs to (only that project's users may open it). */
-  project_id?: number | null;
 }
 
 export interface PageVersionRow {
@@ -111,7 +111,7 @@ export async function fetchPageForEditing(slug: string): Promise<PageVersionRow>
 /** PUT /pages/{slug}/draft - create the page if needed and save the draft. */
 export async function savePageDraft(
   slug: string,
-  payload: { title: string; document: any; label?: string; access?: PageAccess; project_id?: number | null },
+  payload: { title: string; document: any; label?: string; access?: PageAccess; project_id?: number },
 ): Promise<PageVersionRow> {
   const res = await fetch(`${API_BASE}/pages/${encodeURIComponent(slug)}/draft`, {
     method: 'PUT',
